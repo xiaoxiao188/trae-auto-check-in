@@ -44,7 +44,8 @@ async function checkin(token, deviceId) {
   return { http: status, body };
 }
 
-// 查询今日签到状态，补拿「签到积分」（credits 基础分 + extra_credits 额外分）
+// 查询今日签到状态（用于判断「今日已签到」）。注意：extra_credits 只是
+// 「可额外获得」，并未随签到入账（额度包记录证实每日签到实际入账 = credits）
 async function getCheckinStatus(token, deviceId) {
   try {
     const { status, text } = await post(
@@ -65,10 +66,10 @@ async function getCheckinStatus(token, deviceId) {
   }
 }
 
-// 查询额度使用汇总，返回「通用积分」余额
+// 查询额度使用汇总，返回 { general }
 // 积分包按 entitlement_base_info.available_endpoint 区分适用范围：
 // 0 = 通用积分（TraeCode / TraeWork 均可用），1 = Work 专属积分（仅 TraeWork）
-// 通用积分 = Σ(通用包的 credits_limit - 已用)
+// general = Σ(通用包的 credits_limit - 已用)
 async function getGeneralCredits(token, deviceId) {
   try {
     const { status, text } = await post(
@@ -99,7 +100,7 @@ async function getGeneralCredits(token, deviceId) {
       total += limit - (p.usage?.credits_amount ?? 0);
     }
     if (!found) return null;
-    return Math.round(total * 100) / 100;
+    return { general: Math.round(total * 100) / 100 };
   } catch {
     return null;
   }
@@ -202,15 +203,16 @@ async function runCheckin(env) {
         code = result.body?.code ?? -1;
       }
       if (result.http === 200 && (code === 0 || result.body?.checked_in)) {
-        // 签到积分：优先用 claim 返回的 credits；重复签到时 claim 不带分，改查 status
-        let earned = result.body?.credits;
-        if (earned == null) {
+        // 签到积分 = 本次 claim 实际获得的积分；重复签到不返分，显示 +0
+        let earned = result.body?.credits ?? 0;
+        let already = false;
+        if (result.body?.credits == null) {
           const st = await getCheckinStatus(token, deviceId);
-          if (st) earned = (st.credits ?? 0) + (st.extra_credits ?? 0);
+          already = !!st?.checked_in; // 今日已签过（本次未加分）
         }
-        // 通用积分：通用积分包（available_endpoint=0）的额度剩余之和
-        const general = await getGeneralCredits(token, deviceId);
-        results.push({ name: acc.name, ok: true, earned: earned ?? 0, general });
+        // 通用积分余额（available_endpoint=0 的通用积分包剩余之和）
+        const usage = await getGeneralCredits(token, deviceId);
+        results.push({ name: acc.name, ok: true, earned, already, general: usage?.general });
       } else {
         results.push({
           name: acc.name,
@@ -232,7 +234,7 @@ async function runCheckin(env) {
     if (i > 0) lines.push(""); // 多账号之间空一行分隔
     lines.push(`帐号：${r.name}`);
     if (r.ok) {
-      lines.push("签到结果：✅ 成功");
+      lines.push("签到结果：✅ 成功" + (r.already ? "（今日已签到）" : ""));
       lines.push(`签到积分：+${r.earned}`);
       if (r.general != null) lines.push(`通用积分：${r.general}`);
     } else {
