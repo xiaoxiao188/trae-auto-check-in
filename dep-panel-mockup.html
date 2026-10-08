@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>依赖校验 - 设计稿</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #2b2f3a;
+    min-height: 100vh;
+    display: flex; gap: 40px;
+    justify-content: center; align-items: flex-start;
+    padding: 48px 24px;
+    flex-wrap: wrap;
+  }
+  .state-label { text-align: center; color: #fff; font-size: 13px; opacity: .6; margin-bottom: 12px; letter-spacing: 2px; }
+  .dialog { width: 560px; background: #fff; border-radius: 8px; box-shadow: 0 12px 40px rgba(0,0,0,.45); overflow: hidden; }
+  .dialog-header { padding: 16px 20px; font-size: 16px; font-weight: 600; color: #303133; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; }
+  .dialog-header .close { color: #909399; cursor: pointer; font-weight: 400; }
+  .dialog-body { padding: 20px; }
+  .form-row { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+  .form-label { font-size: 13px; color: #606266; width: 110px; }
+  .select, .input {
+    height: 30px; border: 1px solid #dcdfe6; border-radius: 4px;
+    padding: 0 10px; font-size: 13px; color: #606266;
+    display: inline-flex; align-items: center; background: #fff;
+    min-width: 90px; justify-content: space-between;
+  }
+  .select .caret { color: #c0c4cc; font-size: 10px; margin-left: 8px; }
+  .cron-tag { font-family: Consolas, monospace; font-size: 12px; color: #909399; background: #f4f4f5; border-radius: 4px; padding: 3px 8px; }
+  .tip { font-size: 12px; color: #909399; line-height: 1.6; margin: -6px 0 14px 0; }
+  .switch { width: 36px; height: 20px; border-radius: 10px; background: #409eff; position: relative; display: inline-block; vertical-align: middle; }
+  .switch::after { content: ''; position: absolute; width: 16px; height: 16px; background: #fff; border-radius: 50%; top: 2px; right: 2px; }
+  .switch-label { font-size: 13px; color: #409eff; margin-right: 6px; }
+  .divider { border: none; border-top: 1px solid #ebeef5; margin: 4px 0 16px; }
+  .dep-summary { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 6px; font-size: 13px; }
+  .dep-summary.ok   { background: #f0f9eb; }
+  .dep-summary.warn { background: #fdf6ec; }
+  .dep-summary .icon { font-size: 16px; }
+  .dep-summary.ok .icon, .dep-summary.ok .num { color: #67c23a; }
+  .dep-summary.warn .icon, .dep-summary.warn .num { color: #e6a23c; }
+  .dep-summary .num { font-weight: 700; font-size: 14px; }
+  .dep-summary .meta { color: #909399; font-size: 12px; margin-left: auto; }
+  .dep-summary .toggle { color: #409eff; font-size: 12px; cursor: pointer; margin-left: 10px; white-space: nowrap; }
+  .dep-tabs { display: flex; gap: 6px; margin: 12px 0 8px; }
+  .dep-tab { font-size: 12px; padding: 4px 12px; border-radius: 4px; border: 1px solid #dcdfe6; color: #606266; cursor: pointer; }
+  .dep-tab.active { background: #409eff; border-color: #409eff; color: #fff; }
+  .dep-tab .badge { font-size: 11px; opacity: .75; }
+</style>
+<style>
+  .dep-list { border: 1px solid #ebeef5; border-radius: 6px; max-height: 216px; overflow-y: auto; }
+  .dep-list::-webkit-scrollbar { width: 6px; }
+  .dep-list::-webkit-scrollbar-thumb { background: #dcdfe6; border-radius: 3px; }
+  .dep-row { display: flex; align-items: center; gap: 10px; padding: 9px 14px; font-size: 13px; border-bottom: 1px solid #f5f7fa; }
+  .dep-row:last-child { border-bottom: none; }
+  .dep-row.dim { opacity: .55; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .dot.ready   { background: #67c23a; }
+  .dot.pending { background: #e6a23c; box-shadow: 0 0 0 3px rgba(230,162,60,.18); }
+  .dot.waiting { background: #409eff; box-shadow: 0 0 0 3px rgba(64,158,255,.15); }
+  .dot.skipped { background: #c0c4cc; }
+  .dep-name { font-weight: 500; color: #303133; }
+  .dep-type { font-size: 11px; padding: 1px 6px; border-radius: 3px; border: 1px solid #d9ecff; color: #409eff; background: #ecf5ff; }
+  .dep-type.prepare { border-color: #e1f3d8; color: #67c23a; background: #f0f9eb; }
+  .dep-period { font-size: 12px; color: #909399; font-family: Consolas, monospace; }
+  .dep-status { margin-left: auto; font-size: 12px; color: #909399; }
+  .dep-status.pending { color: #e6a23c; font-weight: 500; }
+  .dep-status.waiting { color: #409eff; }
+  .dialog-footer { padding: 14px 20px; border-top: 1px solid #f0f0f0; display: flex; justify-content: flex-end; gap: 10px; }
+  .btn { height: 32px; padding: 0 18px; border-radius: 4px; font-size: 13px; border: 1px solid #dcdfe6; background: #fff; color: #606266; cursor: pointer; }
+  .btn.primary { background: #409eff; border-color: #409eff; color: #fff; }
+</style>
+</head>
+<body>
+<!-- ================= 状态一：全部就绪（默认折叠态） ================= -->
+<div>
+  <div class="state-label">状态一 · 全部就绪（默认折叠，只占一行）</div>
+  <div class="dialog">
+    <div class="dialog-header">编辑任务 · 构建POI维表 <span class="close">✕</span></div>
+    <div class="dialog-body">
+      <div class="form-row">
+        <span class="form-label">执行频率</span>
+        <span class="select">每天 <span class="caret">▾</span></span>
+        <span class="select">02 时 <span class="caret">▾</span></span>
+        <span class="select">00 分 <span class="caret">▾</span></span>
+        <span style="font-size:12px;color:#909399">对应 cron：</span>
+        <span class="cron-tag">0 2 * * *</span>
+      </div>
+
+      <hr class="divider">
+
+      <div class="tip">依赖校验（导入任务按调度粒度成功 + 数据准备当期就绪后才执行；天调度看当日，月调度看当前周期）</div>
+
+      <div class="form-row">
+        <span class="form-label" style="width:auto"><span class="switch-label">启用</span><span class="switch"></span></span>
+        <span class="form-label" style="width:auto;margin-left:24px">依赖宽限期（分钟）</span>
+        <span class="input" style="min-width:80px">90</span>
+        <span class="form-label" style="width:auto;margin-left:16px">轮询间隔（分钟）</span>
+        <span class="input" style="min-width:70px">5</span>
+      </div>
+
+      <!-- ★ 汇总条：一行给出结论，替代原来两个大分组块 -->
+      <div class="dep-summary ok">
+        <span class="icon">✔</span>
+        <span><span class="num">6/6</span> 已就绪</span>
+        <span class="meta">数据导入 0 项 · 数据准备 6 项 · 已跳过 1 项</span>
+        <span class="toggle">详情 ▾</span>
+      </div>
+    </div>
+    <div class="dialog-footer">
+      <button class="btn">取 消</button>
+      <button class="btn primary">保 存</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- ================= 状态二：存在未就绪（展开详情） ================= -->
+<div>
+  <div class="state-label">状态二 · 存在未就绪（展开详情，列表固定高度滚动）</div>
+  <div class="dialog">
+    <div class="dialog-header">编辑任务 · 构建POI维表 <span class="close">✕</span></div>
+    <div class="dialog-body">
+      <div class="form-row">
+        <span class="form-label">执行频率</span>
+        <span class="select">每天 <span class="caret">▾</span></span>
+        <span class="select">02 时 <span class="caret">▾</span></span>
+        <span class="select">00 分 <span class="caret">▾</span></span>
+        <span style="font-size:12px;color:#909399">对应 cron：</span>
+        <span class="cron-tag">0 2 * * *</span>
+      </div>
+
+      <hr class="divider">
+
+      <div class="tip">依赖校验（导入任务按调度粒度成功 + 数据准备当期就绪后才执行；天调度看当日，月调度看当前周期）</div>
+
+      <div class="form-row">
+        <span class="form-label" style="width:auto"><span class="switch-label">启用</span><span class="switch"></span></span>
+        <span class="form-label" style="width:auto;margin-left:24px">依赖宽限期（分钟）</span>
+        <span class="input" style="min-width:80px">90</span>
+        <span class="form-label" style="width:auto;margin-left:16px">轮询间隔（分钟）</span>
+        <span class="input" style="min-width:70px">5</span>
+      </div>
+
+      <!-- ★ 汇总条（告警色） -->
+      <div class="dep-summary warn">
+        <span class="icon">⚠</span>
+        <span><span class="num">4/8</span> 已就绪，<span class="num">2</span> 项未就绪</span>
+        <span class="meta">数据导入 2 项 · 数据准备 6 项</span>
+        <span class="toggle">收起 ▴</span>
+      </div>
+
+      <!-- ★ 状态过滤页签 -->
+      <div class="dep-tabs">
+        <span class="dep-tab active">全部 <span class="badge">8</span></span>
+        <span class="dep-tab">未就绪 <span class="badge">2</span></span>
+        <span class="dep-tab">等待中 <span class="badge">1</span></span>
+        <span class="dep-tab">已跳过 <span class="badge">1</span></span>
+      </div>
+
+      <!-- ★ 固定高度滚动列表，未就绪自动排在最前 -->
+      <div class="dep-list">
+        <div class="dep-row">
+          <span class="dot pending"></span>
+          <span class="dep-name">货运订单导入</span>
+          <span class="dep-type">导入</span>
+          <span class="dep-period">20260921</span>
+          <span class="dep-status pending">未就绪 · 调度未成功</span>
+        </div>
+        <div class="dep-row">
+          <span class="dot pending"></span>
+          <span class="dep-name">POI 灯光</span>
+          <span class="dep-type prepare">准备</span>
+          <span class="dep-period">202608</span>
+          <span class="dep-status pending">未就绪 · 等待当期数据</span>
+        </div>
+        <div class="dep-row">
+          <span class="dot waiting"></span>
+          <span class="dep-name">车流数据导入</span>
+          <span class="dep-type">导入</span>
+          <span class="dep-period">20260921</span>
+          <span class="dep-status waiting">执行中 65%</span>
+        </div>
+        <div class="dep-row dim">
+          <span class="dot skipped"></span>
+          <span class="dep-name">企业经纬度补全</span>
+          <span class="dep-type prepare">准备</span>
+          <span class="dep-period">202608</span>
+          <span class="dep-status">已跳过 · 本周期无待处理企业</span>
+        </div>
+        <div class="dep-row dim">
+          <span class="dot ready"></span>
+          <span class="dep-name">企业点灯光</span>
+          <span class="dep-type prepare">准备</span>
+          <span class="dep-period">202608</span>
+          <span class="dep-status">已就绪</span>
+        </div>
+        <div class="dep-row dim">
+          <span class="dot ready"></span>
+          <span class="dep-name">网格灯光</span>
+          <span class="dep-type prepare">准备</span>
+          <span class="dep-period">202608</span>
+          <span class="dep-status">已就绪</span>
+        </div>
+        <div class="dep-row dim">
+          <span class="dot ready"></span>
+          <span class="dep-name">AOI 灯光</span>
+          <span class="dep-type prepare">准备</span>
+          <span class="dep-period">202608</span>
+          <span class="dep-status">已就绪</span>
+        </div>
+        <div class="dep-row dim">
+          <span class="dot ready"></span>
+          <span class="dep-name">AI 经济指标估算</span>
+          <span class="dep-type prepare">准备</span>
+          <span class="dep-period">202608</span>
+          <span class="dep-status">已就绪</span>
+        </div>
+      </div>
+    </div>
+    <div class="dialog-footer">
+      <button class="btn">取 消</button>
+      <button class="btn primary">保 存</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

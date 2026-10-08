@@ -66,11 +66,13 @@ async function getCheckinStatus(token, deviceId) {
   }
 }
 
-// 查询额度使用汇总，返回 { general }
+// 查询额度使用汇总，返回 { general, work, total, todayCheckin }
 // 积分包按 entitlement_base_info.available_endpoint 区分适用范围：
 // 0 = 通用积分（TraeCode / TraeWork 均可用），1 = Work 专属积分（仅 TraeWork）
-// general = Σ(通用包的 credits_limit - 已用)
-async function getGeneralCredits(token, deviceId) {
+// general = Σ(通用包剩余)，work = Σ(Work专属包剩余)，total = 全部可量化包的剩余之和
+// todayCheckin = 今日签到实际入账（entitlement_id 形如 checkin_20260922_xxx 的包额度）
+// 注意：free_xxx 基础免费包没有 credits_limit（不可量化），不计入任何汇总
+async function getCredits(token, deviceId) {
   try {
     const { status, text } = await post(
       "/trae/api/v2/pay/web_user_ent_usage",
@@ -86,21 +88,43 @@ async function getGeneralCredits(token, deviceId) {
     if (status !== 200) return null;
     const packs = JSON.parse(text)?.user_entitlement_pack_list;
     if (!Array.isArray(packs)) return null;
-    let total = 0,
-      found = false;
+    // 北京时间当天日期，用于匹配今日签到包（checkin_yyyyMMdd_xxx）
+    const today = new Date(Date.now() + 8 * 3600e3)
+      .toISOString()
+      .slice(0, 10)
+      .replace(/-/g, "");
+    const r2 = (v) => Math.round(v * 100) / 100;
+    let general = 0,
+      work = 0,
+      other = 0,
+      found = false,
+      todayCheckin = 0;
     for (const p of packs) {
       const info = p?.entitlement_base_info;
-      if (!info || info.available_endpoint !== 0) continue; // 只统计通用积分包
+      if (!info) continue;
       const limit =
         info.quota?.credits_limit ??
         info.product_extra?.package_extra?.quota?.credits_limit ??
         info.product_extra?.subscription_extra?.quota?.credits_limit;
-      if (typeof limit !== "number") continue;
+      if (typeof limit !== "number") continue; // 无额度上限的包（如免费基础包）不可量化
       found = true;
-      total += limit - (p.usage?.credits_amount ?? 0);
+      const remain = limit - (p.usage?.credits_amount ?? 0);
+      if (info.available_endpoint === 0) general += remain;
+      else if (info.available_endpoint === 1) work += remain;
+      else other += remain;
+      if (info.available_endpoint === 0 &&
+          typeof info.entitlement_id === "string" &&
+          info.entitlement_id.startsWith("checkin_" + today)) {
+        todayCheckin += limit;
+      }
     }
     if (!found) return null;
-    return { general: Math.round(total * 100) / 100 };
+    return {
+      general: r2(general),
+      work: r2(work),
+      total: r2(general + work + other),
+      todayCheckin,
+    };
   } catch {
     return null;
   }
@@ -193,6 +217,21 @@ async function runCheckin(env) {
     let deviceId = acc.deviceId || randomDeviceId();
     try {
       const token = await getToken(acc.session);
+      // 先查状态：今日已签到则跳过 claim，直接显示 +0（避免重复请求触发风控）
+      const st0 = await getCheckinStatus(token, deviceId);
+      if (st0?.checked_in) {
+        const usage = await getCredits(token, deviceId);
+        results.push({
+          name: acc.name,
+          ok: true,
+          earned: 0,
+          already: true,
+          general: usage?.general,
+          work: usage?.work,
+          total: usage?.total,
+        });
+        continue;
+      }
       let result = await checkin(token, deviceId);
       let code = result.body?.code ?? -1;
       // 9074「参与用户太多」→ 换新设备号重试，最多 5 次
@@ -203,16 +242,20 @@ async function runCheckin(env) {
         code = result.body?.code ?? -1;
       }
       if (result.http === 200 && (code === 0 || result.body?.checked_in)) {
-        // 签到积分 = 本次 claim 实际获得的积分；重复签到不返分，显示 +0
-        let earned = result.body?.credits ?? 0;
-        let already = false;
-        if (result.body?.credits == null) {
-          const st = await getCheckinStatus(token, deviceId);
-          already = !!st?.checked_in; // 今日已签过（本次未加分）
-        }
-        // 通用积分余额（available_endpoint=0 的通用积分包剩余之和）
-        const usage = await getGeneralCredits(token, deviceId);
-        results.push({ name: acc.name, ok: true, earned, already, general: usage?.general });
+        // 签到积分 = 本次实际入账：优先 claim 返回值；claim 不带分时取当日「签到奖励」积分包额度
+        const usage = await getCredits(token, deviceId);
+        let earned = result.body?.credits ?? null;
+        if (earned == null)
+          earned = usage?.todayCheckin > 0 ? usage.todayCheckin : 0;
+        results.push({
+          name: acc.name,
+          ok: true,
+          earned,
+          already: false,
+          general: usage?.general,
+          work: usage?.work,
+          total: usage?.total,
+        });
       } else {
         results.push({
           name: acc.name,
@@ -237,6 +280,8 @@ async function runCheckin(env) {
       lines.push("签到结果：✅ 成功" + (r.already ? "（今日已签到）" : ""));
       lines.push(`签到积分：+${r.earned}`);
       if (r.general != null) lines.push(`通用积分：${r.general}`);
+      if (r.work != null) lines.push(`Work 专属积分：${r.work}`);
+      if (r.total != null) lines.push(`总可用积分：${r.total}`);
     } else {
       lines.push(`签到结果：❌ 失败（${r.reason}）`);
     }
