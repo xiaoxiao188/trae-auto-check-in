@@ -130,6 +130,42 @@ async function getCredits(token, deviceId) {
   }
 }
 
+// 拉取账号资料（昵称 / 脱敏手机号，逆向自 www.trae.cn/dashboard），用于把推送里的
+// 「账号 N」换成直观的昵称/手机号。NonPlainTextMobile 官方已脱敏（如 138****1234），可安全推送。
+// 请求头与 TraeTools 同款：JWT + Session Cookie + Referer/Origin，无需 x-device-id；
+// 失败返回 null，不影响签到主流程（展示回退为「账号 N」）
+async function getUserInfo(token, session) {
+  try {
+    const headers = {
+      "Content-Type": "application/json",
+      "Referer": "https://www.trae.cn/",
+      "Origin": "https://www.trae.cn",
+      "User-Agent": "TraeCheckin/1.0",
+    };
+    if (token) headers["Authorization"] = "Cloud-IDE-JWT " + token;
+    if (session) headers["Cookie"] = "X-Cloudide-Session=" + session;
+    const { status, text } = await post("/cloudide/api/v3/trae/GetUserInfo", headers);
+    if (status !== 200) return null;
+    const r = JSON.parse(text)?.Result;
+    if (!r || typeof r !== "object") return null;
+    return {
+      userId: typeof r.UserID === "string" ? r.UserID : null,
+      screenName: typeof r.ScreenName === "string" ? r.ScreenName : null,
+      mobileMasked: typeof r.NonPlainTextMobile === "string" ? r.NonPlainTextMobile : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// 推送里展示用的账号名：昵称 + 脱敏手机号优先，都拿不到则回退「账号 N」
+function displayLabel(acc, info) {
+  const parts = [];
+  if (info?.screenName) parts.push(info.screenName);
+  if (info?.mobileMasked) parts.push(info.mobileMasked);
+  return parts.length ? parts.join(" ") : acc.name;
+}
+
 const randomDeviceId = () => String(Math.floor(Math.random() * 9e15) + 1e15);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -217,12 +253,14 @@ async function runCheckin(env) {
     let deviceId = acc.deviceId || randomDeviceId();
     try {
       const token = await getToken(acc.session);
+      const info = await getUserInfo(token, acc.session);
+      const name = displayLabel(acc, info);
       // 先查状态：今日已签到则跳过 claim，直接显示 +0（避免重复请求触发风控）
       const st0 = await getCheckinStatus(token, deviceId);
       if (st0?.checked_in) {
         const usage = await getCredits(token, deviceId);
         results.push({
-          name: acc.name,
+          name,
           ok: true,
           earned: 0,
           already: true,
@@ -248,7 +286,7 @@ async function runCheckin(env) {
         if (earned == null)
           earned = usage?.todayCheckin > 0 ? usage.todayCheckin : 0;
         results.push({
-          name: acc.name,
+          name,
           ok: true,
           earned,
           already: false,
