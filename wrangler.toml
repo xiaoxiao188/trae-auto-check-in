@@ -2,6 +2,6 @@ name = "trae-checkin"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
-# 每日北京时间 10:01 触发 = UTC 02:01，错开签到高峰
+# 每日北京时间 10:05 触发 = UTC 02:05，错开签到高峰
 [triggers]
-crons = ["01 2 * * *"]
+crons = ["05 2 * * *"]

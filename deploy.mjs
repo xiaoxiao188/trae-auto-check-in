@@ -3,7 +3,8 @@
 // 更新 TRAE_SESSION 时自动记录更新日期（TRAE_SESSION_DATE），供 Worker 推送会话剩余天数。
 // 全部输入后有一行汇总与最终确认（回车=部署，n=取消），确认前不写文件、不部署。
 // 之后依次执行 wrangler deploy（同步代码与 cron 触发时间）
-// 和 wrangler secret bulk（上传/更新 secrets）。
+// 和 wrangler secret bulk（上传/更新 secrets），
+// 最后自动访问一次 Worker 根路径触发签到，并在终端显示签到结果。
 // 输入流结束（如 CI 中 stdin 关闭）视为逐项回车，不挂起、沿用文件值。
 import { readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -206,4 +207,17 @@ if (isMain) {
   run(["wrangler", "deploy"]);
   run(["wrangler", "secret", "bulk", SECRETS_FILE]);
   console.log("部署完成：代码 / cron 触发时间 / secrets 均已同步");
+
+  // 部署完成后自动触发一次签到：直接在本地运行同款签到逻辑（import 云端同代码），
+  // 不依赖 workers.dev 域名（该域名在部分地区网络不可达）；结果与钉钉/飞书推送照常发出
+  try {
+    console.log("自动触发一次签到（本地运行同款逻辑）…");
+    await new Promise((r) => setTimeout(r, 2000)); // 等 secrets 传播（新会话/新密钥生效）
+    const { default: worker } = await import("./src/index.js");
+    const env = { ...secrets }; // TRAE_SESSION / 钉钉配置 / TRAE_SESSION_DATE 等
+    const resp = await worker.fetch(new Request("https://localhost/"), env);
+    console.log("—— 签到结果 ——\n" + (await resp.text()));
+  } catch (e) {
+    console.log(`自动触发失败：${e.message}（可稍后手动访问 Worker URL 触发）`);
+  }
 }

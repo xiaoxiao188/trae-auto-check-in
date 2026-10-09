@@ -2,6 +2,7 @@
   "name": "trae-checkin",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Trae daily check-in on Cloudflare Workers",
   "scripts": {
     "deploy": "node deploy.mjs",

@@ -47,7 +47,8 @@ npm run deploy            # ② 交互式部署：确认密钥与触发时间 �
   `HH:MM`（如 `08:30`，自动换算为 UTC cron），也可直接输入 5 段 UTC cron 表达式；
 - 全部输入后有一行**汇总确认**（回车=开始部署，n=取消），取消则不写文件、不部署；
 - 确认后依次执行 `wrangler deploy`（同步代码与 cron 触发时间）和
-  `wrangler secret bulk secrets.json`（上传密钥）；CI 等无输入环境自动沿用文件值，不会卡住。
+  `wrangler secret bulk secrets.json`（上传密钥）；CI 等无输入环境自动沿用文件值，不会卡住；
+- 部署完成后会**自动触发一次签到**（本地运行同款签到逻辑，不依赖 workers.dev 域名），终端直接显示签到结果；
 
 > 也可以逐个添加：`npx wrangler secret put TRAE_SESSION`（粘贴值后回车），
 > 或在网页控制台「设置 → 变量和机密」中添加（类型选**机密**）。
@@ -103,7 +104,7 @@ Trae 自动签到
 Work 专属积分：0
 总可用积分：4825.49
 会话有效期：约剩 9 天
-时间：2026-09-23 08:30:05
+签到时间：2026-09-23 08:30:05
 ```
 
 > 帐号名来自 `/cloudide/api/v3/trae/GetUserInfo`（昵称 + 官方已脱敏的手机号，
@@ -138,7 +139,7 @@ Work 专属积分：0
 
 ## 日常维护
 
-- **改了代码 / 定时时间** → `npm run deploy`（想跳过询问快速部署可用 `npx wrangler deploy`）；
+- **改了代码 / 定时时间** → `npm run deploy`，部署完成后自动触发一次签到并显示结果；
 - **Session 过期更新** → `npm run deploy` 在「Trae 登录凭证」处输入新值（自动记录更新日期，提醒才准确）；
 - **只改其他密钥**（钉钉 / 飞书）→ 改 `secrets.json` 后 `npm run secrets`，无需部署；
 - `secrets.json` 已在 `.gitignore` 中排除，不会误提交；若清空了真实值，下次部署时对应项

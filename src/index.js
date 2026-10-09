@@ -343,7 +343,7 @@ async function runCheckin(env) {
       lines.push(`⚠️ 会话约剩 ${sessionLeft} 天：请尽快重新登录 trae.cn 更新（复制 Cookie 后 npm run deploy）`);
     else lines.push(`会话有效期：约剩 ${sessionLeft} 天`);
   }
-  lines.push(`时间：${time}`);
+  lines.push(`签到时间：${time}`);
   const summary = lines.join("\n");
   // 钉钉用 markdown 推送：标题加粗（#### **标题**），标题下用 --- 分割线实现下划线效果；
   // markdown 单换行会折叠，行与行之间用空行分隔
