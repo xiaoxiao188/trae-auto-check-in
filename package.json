@@ -4,7 +4,8 @@
   "private": true,
   "description": "Trae daily check-in on Cloudflare Workers",
   "scripts": {
-    "deploy": "wrangler deploy",
+    "deploy": "node deploy.mjs",
+    "secrets": "wrangler secret bulk secrets.json",
     "dev": "wrangler dev --test-scheduled",
     "tail": "wrangler tail"
   },
