@@ -1,5 +1,9 @@
 const BASE = "https://api.trae.cn";
 
+// 会话（X-Cloudide-Session）有效期实测约 13 天出头，从浏览器登录时算起；
+// 按 13 天估算剩余天数（宁早勿晚），用于到期提醒
+const SESSION_TTL_DAYS = 13;
+
 async function post(path, headers, body = "") {
   const resp = await fetch(BASE + path, { method: "POST", headers, body });
   return { status: resp.status, text: await resp.text() };
@@ -247,6 +251,13 @@ async function runCheckin(env) {
   const accounts = iterAccounts(env);
   if (!accounts.length) return "缺少环境变量 TRAE_SESSION";
 
+  // 会话剩余天数：TRAE_SESSION_DATE 由 deploy 脚本在更新 TRAE_SESSION 时自动记录
+  let sessionLeft = null;
+  if (env.TRAE_SESSION_DATE) {
+    const ms = Date.now() + 8 * 3600e3 - Date.parse(env.TRAE_SESSION_DATE + "T00:00:00+08:00");
+    if (Number.isFinite(ms)) sessionLeft = SESSION_TTL_DAYS - Math.floor(ms / 86400e3);
+  }
+
   const results = [];
   for (const [i, acc] of accounts.entries()) {
     if (i > 0) await sleep(3000 + Math.random() * 3000); // 多账号错开，规避风控
@@ -323,6 +334,14 @@ async function runCheckin(env) {
     } else {
       lines.push(`签到结果：❌ 失败（${r.reason}）`);
     }
+  }
+  // 会话到期提醒：剩 3 天以内 ⚠️ 高亮，避免突然失效才发现
+  if (sessionLeft != null) {
+    if (sessionLeft <= 0)
+      lines.push("⚠️ 会话可能已过期：请重新登录 trae.cn，复制新的 X-Cloudide-Session 后运行 npm run deploy");
+    else if (sessionLeft <= 3)
+      lines.push(`⚠️ 会话约剩 ${sessionLeft} 天：请尽快重新登录 trae.cn 更新（复制 Cookie 后 npm run deploy）`);
+    else lines.push(`会话有效期：约剩 ${sessionLeft} 天`);
   }
   lines.push(`时间：${time}`);
   const summary = lines.join("\n");

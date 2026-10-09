@@ -1,5 +1,6 @@
 // 交互式部署：部署前逐项确认 secrets 与定时触发时间，直接回车 = 沿用文件中的值，
 // 输入新值则覆盖并写回 secrets.json / wrangler.toml（作为下次部署的默认值）。
+// 更新 TRAE_SESSION 时自动记录更新日期（TRAE_SESSION_DATE），供 Worker 推送会话剩余天数。
 // 全部输入后有一行汇总与最终确认（回车=部署，n=取消），确认前不写文件、不部署。
 // 之后依次执行 wrangler deploy（同步代码与 cron 触发时间）
 // 和 wrangler secret bulk（上传/更新 secrets）。
@@ -114,9 +115,9 @@ export async function collectChanges(ask, secrets, curCron) {
   }
 
   // 汇总确认：这一步回车之前不写文件、不部署
-  const changedKeys = KEYS
-    .filter(([k]) => secrets[k] && secrets[k] !== before[k])
-    .map(([, label]) => label);
+  const changedPairs = KEYS.filter(([k]) => secrets[k] && secrets[k] !== before[k]);
+  const changed = changedPairs.map(([k]) => k);
+  const changedKeys = changedPairs.map(([, label]) => label);
   const newBj = cronToBeijing(newCron);
   console.log("—— 即将部署 ——");
   console.log(
@@ -132,7 +133,12 @@ export async function collectChanges(ask, secrets, curCron) {
     }`
   );
   const go = (await ask("确认执行部署？（回车=部署，n=取消）: ")).trim().toLowerCase();
-  return { confirmed: go !== "n" && go !== "no" && go !== "否", changedKeys, newCron };
+  return {
+    confirmed: go !== "n" && go !== "no" && go !== "否",
+    changed,
+    changedKeys,
+    newCron,
+  };
 }
 
 const isMain =
@@ -156,12 +162,21 @@ if (isMain) {
   // 所有询问结束后才关闭输入流（此前版本提前关闭，导致触发时间询问被跳过）
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const ask = createAsker(rl);
-  const { confirmed, newCron } = await collectChanges(ask, secrets, curCron);
+  const { confirmed, changed, newCron } = await collectChanges(ask, secrets, curCron);
   rl.close();
 
   if (!confirmed) {
     console.log("已取消：未修改任何文件、未部署");
     process.exit(0);
+  }
+
+  // 更新 TRAE_SESSION 时同步记录更新日期（存入 secrets.json 一并 bulk 上传），
+  // Worker 据此在每天的推送中显示会话剩余天数
+  const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+  let dateNote = "";
+  if (changed.includes("TRAE_SESSION") || !secrets.TRAE_SESSION_DATE) {
+    secrets.TRAE_SESSION_DATE = today;
+    dateNote = `会话更新日期已记录：${today}`;
   }
 
   // 确认后才写回：secrets.json 按 KEYS 顺序重排，保留文件中已有的其他键
@@ -181,6 +196,7 @@ if (isMain) {
     const bj = cronToBeijing(newCron);
     console.log(`已更新触发时间：${bj ? `北京 ${bj}` : `cron ${newCron}`}`);
   }
+  if (dateNote) console.log(dateNote);
 
   const run = (args) => {
     const r = spawnSync("npx", args, { stdio: "inherit", shell: true });
