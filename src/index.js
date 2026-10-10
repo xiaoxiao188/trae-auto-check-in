@@ -15,9 +15,22 @@ const authHeaders = (token, deviceId) => ({
   "User-Agent": "TraeCheckin/1.0",
 });
 
+// POST 请求：网络异常或上游 5xx 时自动重试（共 3 次，间隔递增），避免 cron 当天
+// 一次网络抖动就错过签到；4xx 属业务错误（401 失效、风控等）不重试，直接返回
 async function post(path, headers, body = "") {
-  const resp = await fetch(BASE + path, { method: "POST", headers, body });
-  return { status: resp.status, text: await resp.text() };
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await sleep(700 * attempt + Math.random() * 500);
+    try {
+      const resp = await fetch(BASE + path, { method: "POST", headers, body });
+      const text = await resp.text();
+      if (resp.status < 500 || attempt === 2) return { status: resp.status, text };
+      lastErr = new Error("HTTP " + resp.status);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
 }
 
 // 用 X-Cloudide-Session 换新 JWT
@@ -162,7 +175,12 @@ function displayLabel(acc, info) {
   return parts.length ? parts.join(" ") : acc.name;
 }
 
-const randomDeviceId = () => String(Math.floor(Math.random() * 9e15) + 1e15);
+// 16 位数字设备号：与 randomUUID、HMAC 加签统一用 crypto 随机源
+const randomDeviceId = () => {
+  const v = new BigUint64Array(1);
+  crypto.getRandomValues(v);
+  return String((v[0] % 9_000_000_000_000_000n) + 1_000_000_000_000_000n);
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -187,7 +205,12 @@ async function notifyDingTalk(webhook, secret, title, mdText) {
   webhook = (webhook || "").trim();
   secret = (secret || "").trim();
   if (!webhook) return "钉钉：未配置 DINGTALK_WEBHOOK";
-  let url = webhook;
+  let url;
+  try {
+    url = new URL(webhook);
+  } catch {
+    return "钉钉：Webhook 地址无效";
+  }
   if (secret) {
     const timestamp = Date.now();
     const enc = new TextEncoder();
@@ -203,10 +226,9 @@ async function notifyDingTalk(webhook, secret, title, mdText) {
       key,
       enc.encode(`${timestamp}\n${secret}`)
     );
-    const sign = encodeURIComponent(
-      btoa(String.fromCharCode(...new Uint8Array(sig)))
-    );
-    url += `&timestamp=${timestamp}&sign=${sign}`;
+    // searchParams 会做 URL 编码，直接放原始 base64（先 encodeURIComponent 会双重编码）
+    url.searchParams.set("timestamp", String(timestamp));
+    url.searchParams.set("sign", btoa(String.fromCharCode(...new Uint8Array(sig))));
   }
   try {
     const resp = await fetch(url, {
@@ -224,27 +246,28 @@ async function notifyDingTalk(webhook, secret, title, mdText) {
   }
 }
 
-// 读取 TRAE_SESSION, TRAE_SESSION_2, TRAE_SESSION_3 ... 及各自的会话更新日期
+// 读取 TRAE_SESSION（账号 1）、TRAE_SESSION_2、TRAE_SESSION_3 … 及各自的设备号与更新日期。
+// 不在首个缺失编号处停止：中间断号（如只配 _3 未配 _2）的账号仍会签到，
+// 缺失编号记入 gaps 由调用方在推送中提示，避免悄悄漏签
 function iterAccounts(env) {
-  const accounts = [];
-  if (env.TRAE_SESSION)
-    accounts.push({
-      name: "账号 1",
-      session: env.TRAE_SESSION,
-      deviceId: env.TRAE_DEVICE_ID || "",
-      sessionDate: env.TRAE_SESSION_DATE || "",
-    });
-  for (let n = 2; ; n++) {
-    const s = env[`TRAE_SESSION_${n}`];
-    if (!s) break;
-    accounts.push({
-      name: `账号 ${n}`,
-      session: s,
-      deviceId: env[`TRAE_DEVICE_ID_${n}`] || "",
-      sessionDate: env[`TRAE_SESSION_DATE_${n}`] || "",
-    });
-  }
-  return accounts;
+  const nums = [];
+  if (env.TRAE_SESSION) nums.push(1);
+  for (let n = 2; n <= 99; n++) if (env[`TRAE_SESSION_${n}`]) nums.push(n);
+  const gaps = [];
+  for (let n = 1; n < nums[nums.length - 1]; n++)
+    if (!nums.includes(n)) gaps.push(n);
+  return {
+    gaps,
+    accounts: nums.map((n) => {
+      const suffix = n === 1 ? "" : `_${n}`;
+      return {
+        name: `账号 ${n}`,
+        session: env[`TRAE_SESSION${suffix}`],
+        deviceId: env[`TRAE_DEVICE_ID${suffix}`] || "",
+        sessionDate: env[`TRAE_SESSION_DATE${suffix}`] || "",
+      };
+    }),
+  };
 }
 
 // 会话剩余天数：sessionDate 由 deploy 脚本更新对应 TRAE_SESSION(_N) 时自动记录；
@@ -257,7 +280,7 @@ function sessionLeftDays(sessionDate) {
 }
 
 async function runCheckin(env) {
-  const accounts = iterAccounts(env);
+  const { accounts, gaps } = iterAccounts(env);
   if (!accounts.length) return "缺少环境变量 TRAE_SESSION";
 
   const results = [];
@@ -330,9 +353,13 @@ async function runCheckin(env) {
 
   const time = bjNow().toISOString().replace("T", " ").slice(0, 19);
   const lines = ["Trae 自动签到"];
+  if (gaps.length)
+    lines.push(
+      `⚠️ 未配置 ${gaps.map((n) => `TRAE_SESSION${n === 1 ? "" : "_" + n}`).join("，")}，对应账号不会签到`
+    );
   for (const [i, r] of results.entries()) {
     if (i > 0) lines.push(""); // 多账号之间空一行分隔
-    lines.push(`帐号：${r.name}`);
+    lines.push(`账号：${r.name}`);
     if (r.ok) {
       lines.push("签到结果：✅ 成功" + (r.already ? "（今日已签到）" : ""));
       lines.push(`签到积分：+${r.earned}`);
