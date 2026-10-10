@@ -8,7 +8,8 @@
     "deploy": "node deploy.mjs",
     "secrets": "wrangler secret bulk secrets.json",
     "dev": "wrangler dev --test-scheduled",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "test": "node --test"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

@@ -1,6 +1,6 @@
 // 交互式部署：部署前逐项确认 secrets 与定时触发时间，直接回车 = 沿用文件中的值，
 // 输入新值则覆盖并写回 secrets.json / wrangler.toml（作为下次部署的默认值）。
-// 更新 TRAE_SESSION 时自动记录更新日期（TRAE_SESSION_DATE），供 Worker 推送会话剩余天数。
+// 更新 TRAE_SESSION(_N) 时自动记录更新日期（TRAE_SESSION_DATE(_N)），供 Worker 推送会话剩余天数。
 // 全部输入后有一行汇总与最终确认（回车=部署，n=取消），确认前不写文件、不部署。
 // 之后依次执行 wrangler deploy（同步代码与 cron 触发时间）
 // 和 wrangler secret bulk（上传/更新 secrets），
@@ -18,6 +18,8 @@ const KEYS = [
   ["TRAE_SESSION", "Trae 登录凭证"],
   ["DINGTALK_WEBHOOK", "钉钉机器人 Webhook"],
   ["DINGTALK_SECRET", "钉钉加签密钥"],
+  ["FEISHU_WEBHOOK", "飞书机器人 Webhook"],
+  ["TRIGGER_KEY", "手动触发密钥(可选)"],
 ];
 // 可选：通过参数指定其他 secrets 文件，如 node deploy.mjs secrets.test.json
 const SECRETS_FILE = process.argv[2] || "secrets.json";
@@ -171,13 +173,19 @@ if (isMain) {
     process.exit(0);
   }
 
-  // 更新 TRAE_SESSION 时同步记录更新日期（存入 secrets.json 一并 bulk 上传），
-  // Worker 据此在每天的推送中显示会话剩余天数
+  // 更新 TRAE_SESSION(_N) 时同步记录该会话的更新日期（存入 secrets.json 一并 bulk 上传），
+  // Worker 据此在每天的推送中显示各账号的会话剩余天数；
+  // 已有会话缺失日期时以今天补记（无法得知真实登录日期，剩余天数估算偏乐观）
   const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
-  let dateNote = "";
-  if (changed.includes("TRAE_SESSION") || !secrets.TRAE_SESSION_DATE) {
-    secrets.TRAE_SESSION_DATE = today;
-    dateNote = `会话更新日期已记录：${today}`;
+  const dateNotes = [];
+  for (const k of Object.keys(secrets)) {
+    const m = k.match(/^TRAE_SESSION(_\d+)?$/);
+    if (!m) continue;
+    const dateKey = `TRAE_SESSION_DATE${m[1] || ""}`;
+    if ((changed.includes(k) || !secrets[dateKey]) && secrets[dateKey] !== today) {
+      secrets[dateKey] = today;
+      dateNotes.push(`${dateKey}=${today}`);
+    }
   }
 
   // 确认后才写回：secrets.json 按 KEYS 顺序重排，保留文件中已有的其他键
@@ -197,7 +205,8 @@ if (isMain) {
     const bj = cronToBeijing(newCron);
     console.log(`已更新触发时间：${bj ? `北京 ${bj}` : `cron ${newCron}`}`);
   }
-  if (dateNote) console.log(dateNote);
+  if (dateNotes.length)
+    console.log("会话更新日期已记录：" + dateNotes.join("，"));
 
   const run = (args) => {
     const r = spawnSync("npx", args, { stdio: "inherit", shell: true });
@@ -214,8 +223,10 @@ if (isMain) {
     console.log("自动触发一次签到（本地运行同款逻辑）…");
     await new Promise((r) => setTimeout(r, 2000)); // 等 secrets 传播（新会话/新密钥生效）
     const { default: worker } = await import("./src/index.js");
-    const env = { ...secrets }; // TRAE_SESSION / 钉钉配置 / TRAE_SESSION_DATE 等
-    const resp = await worker.fetch(new Request("https://localhost/"), env);
+    const env = { ...secrets }; // TRAE_SESSION / 钉钉配置 / TRIGGER_KEY 等
+    const url = new URL("https://localhost/");
+    if (env.TRIGGER_KEY) url.searchParams.set("key", env.TRIGGER_KEY); // 与线上手动触发同一鉴权
+    const resp = await worker.fetch(new Request(url), env);
     console.log("—— 签到结果 ——\n" + (await resp.text()));
   } catch (e) {
     console.log(`自动触发失败：${e.message}（可稍后手动访问 Worker URL 触发）`);

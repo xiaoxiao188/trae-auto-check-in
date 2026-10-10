@@ -4,6 +4,17 @@ const BASE = "https://api.trae.cn";
 // 按 13 天估算剩余天数（宁早勿晚），用于到期提醒
 const SESSION_TTL_DAYS = 13;
 
+const bjNow = () => new Date(Date.now() + 8 * 3600e3); // 北京时间（UTC+8，不受运行环境时区影响）
+
+// 签到相关接口的公共鉴权头
+const authHeaders = (token, deviceId) => ({
+  "Authorization": "Cloud-IDE-JWT " + token,
+  "X-User-Region": "cn",
+  "x-device-id": deviceId,
+  "Content-Type": "application/json",
+  "User-Agent": "TraeCheckin/1.0",
+});
+
 async function post(path, headers, body = "") {
   const resp = await fetch(BASE + path, { method: "POST", headers, body });
   return { status: resp.status, text: await resp.text() };
@@ -18,10 +29,12 @@ async function getToken(session) {
     "User-Agent": "TraeCheckin/1.0",
     "Accept": "application/json, text/plain, */*",
   });
-  const data = JSON.parse(text);
-  const token = data?.Result?.Token;
   if (status === 401)
     throw new Error("会话已失效(401)，需重新登录 trae.cn 更新 TRAE_SESSION");
+  let token = null;
+  try {
+    token = JSON.parse(text)?.Result?.Token;
+  } catch {} // 非 JSON（如网关错误页）按无 token 处理，走下面的统一报错
   if (status !== 200 || !token)
     throw new Error(`GetUserToken 失败: HTTP ${status} ${text.slice(0, 200)}`);
   return token;
@@ -30,13 +43,7 @@ async function getToken(session) {
 async function checkin(token, deviceId) {
   const { status, text } = await post(
     "/trae/api/v2/ug/checkin_credits/claim",
-    {
-      "Authorization": "Cloud-IDE-JWT " + token,
-      "X-User-Region": "cn",
-      "x-device-id": deviceId,
-      "Content-Type": "application/json",
-      "User-Agent": "TraeCheckin/1.0",
-    },
+    authHeaders(token, deviceId),
     "{}"
   );
   let body;
@@ -54,13 +61,7 @@ async function getCheckinStatus(token, deviceId) {
   try {
     const { status, text } = await post(
       "/trae/api/v2/ug/checkin_credits/status",
-      {
-        "Authorization": "Cloud-IDE-JWT " + token,
-        "X-User-Region": "cn",
-        "x-device-id": deviceId,
-        "Content-Type": "application/json",
-        "User-Agent": "TraeCheckin/1.0",
-      },
+      authHeaders(token, deviceId),
       "{}"
     );
     if (status !== 200) return null;
@@ -80,23 +81,14 @@ async function getCredits(token, deviceId) {
   try {
     const { status, text } = await post(
       "/trae/api/v2/pay/web_user_ent_usage",
-      {
-        "Authorization": "Cloud-IDE-JWT " + token,
-        "X-User-Region": "cn",
-        "x-device-id": deviceId,
-        "Content-Type": "application/json",
-        "User-Agent": "TraeCheckin/1.0",
-      },
+      authHeaders(token, deviceId),
       "{}"
     );
     if (status !== 200) return null;
     const packs = JSON.parse(text)?.user_entitlement_pack_list;
     if (!Array.isArray(packs)) return null;
     // 北京时间当天日期，用于匹配今日签到包（checkin_yyyyMMdd_xxx）
-    const today = new Date(Date.now() + 8 * 3600e3)
-      .toISOString()
-      .slice(0, 10)
-      .replace(/-/g, "");
+    const today = bjNow().toISOString().slice(0, 10).replace(/-/g, "");
     const r2 = (v) => Math.round(v * 100) / 100;
     let general = 0,
       work = 0,
@@ -175,12 +167,18 @@ const randomDeviceId = () => String(Math.floor(Math.random() * 9e15) + 1e15);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function notifyFeishu(webhook, text) {
-  if (!webhook) return;
-  await fetch(webhook, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ msg_type: "text", content: { text } }),
-  }).catch(() => {});
+  webhook = (webhook || "").trim();
+  if (!webhook) return null;
+  try {
+    const resp = await fetch(webhook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ msg_type: "text", content: { text } }),
+    });
+    return `飞书：HTTP ${resp.status} ${await resp.text()}`;
+  } catch (e) {
+    return `飞书：请求异常 ${e.message}`;
+  }
 }
 
 // 钉钉群机器人推送（markdown 消息，标题带下划线样式）。
@@ -226,7 +224,7 @@ async function notifyDingTalk(webhook, secret, title, mdText) {
   }
 }
 
-// 读取 TRAE_SESSION, TRAE_SESSION_2, TRAE_SESSION_3 ...
+// 读取 TRAE_SESSION, TRAE_SESSION_2, TRAE_SESSION_3 ... 及各自的会话更新日期
 function iterAccounts(env) {
   const accounts = [];
   if (env.TRAE_SESSION)
@@ -234,6 +232,7 @@ function iterAccounts(env) {
       name: "账号 1",
       session: env.TRAE_SESSION,
       deviceId: env.TRAE_DEVICE_ID || "",
+      sessionDate: env.TRAE_SESSION_DATE || "",
     });
   for (let n = 2; ; n++) {
     const s = env[`TRAE_SESSION_${n}`];
@@ -242,32 +241,39 @@ function iterAccounts(env) {
       name: `账号 ${n}`,
       session: s,
       deviceId: env[`TRAE_DEVICE_ID_${n}`] || "",
+      sessionDate: env[`TRAE_SESSION_DATE_${n}`] || "",
     });
   }
   return accounts;
+}
+
+// 会话剩余天数：sessionDate 由 deploy 脚本更新对应 TRAE_SESSION(_N) 时自动记录；
+// 按 SESSION_TTL_DAYS 估算（宁早勿晚），日期未知返回 null
+function sessionLeftDays(sessionDate) {
+  if (!sessionDate) return null;
+  const ms = bjNow() - Date.parse(sessionDate + "T00:00:00+08:00");
+  if (!Number.isFinite(ms)) return null;
+  return SESSION_TTL_DAYS - Math.floor(ms / 86400e3);
 }
 
 async function runCheckin(env) {
   const accounts = iterAccounts(env);
   if (!accounts.length) return "缺少环境变量 TRAE_SESSION";
 
-  // 会话剩余天数：TRAE_SESSION_DATE 由 deploy 脚本在更新 TRAE_SESSION 时自动记录
-  let sessionLeft = null;
-  if (env.TRAE_SESSION_DATE) {
-    const ms = Date.now() + 8 * 3600e3 - Date.parse(env.TRAE_SESSION_DATE + "T00:00:00+08:00");
-    if (Number.isFinite(ms)) sessionLeft = SESSION_TTL_DAYS - Math.floor(ms / 86400e3);
-  }
-
   const results = [];
   for (const [i, acc] of accounts.entries()) {
     if (i > 0) await sleep(3000 + Math.random() * 3000); // 多账号错开，规避风控
     let deviceId = acc.deviceId || randomDeviceId();
+    let name = acc.name;
     try {
       const token = await getToken(acc.session);
-      const info = await getUserInfo(token, acc.session);
-      const name = displayLabel(acc, info);
-      // 先查状态：今日已签到则跳过 claim，直接显示 +0（避免重复请求触发风控）
-      const st0 = await getCheckinStatus(token, deviceId);
+      // 昵称与今日签到状态相互独立，并行查询省一个来回
+      const [info, st0] = await Promise.all([
+        getUserInfo(token, acc.session),
+        getCheckinStatus(token, deviceId),
+      ]);
+      name = displayLabel(acc, info);
+      // 今日已签到则跳过 claim，直接显示 +0（避免重复请求触发风控）
       if (st0?.checked_in) {
         const usage = await getCredits(token, deviceId);
         results.push({
@@ -307,20 +313,22 @@ async function runCheckin(env) {
         });
       } else {
         results.push({
-          name: acc.name,
+          name,
           ok: false,
           reason: result.body?.message || "HTTP " + result.http,
         });
       }
     } catch (e) {
-      results.push({ name: acc.name, ok: false, reason: e.message });
+      results.push({ name, ok: false, reason: e.message });
     }
   }
 
-  const time = new Date(Date.now() + 8 * 3600e3)
-    .toISOString()
-    .replace("T", " ")
-    .slice(0, 19);
+  // 每个账号的会话更新日期独立，剩余天数按账号附加到对应结果
+  // （循环内每个账号恰好产生一条 result，顺序与 accounts 一致）
+  for (const [i, r] of results.entries())
+    r.sessionLeft = sessionLeftDays(accounts[i].sessionDate);
+
+  const time = bjNow().toISOString().replace("T", " ").slice(0, 19);
   const lines = ["Trae 自动签到"];
   for (const [i, r] of results.entries()) {
     if (i > 0) lines.push(""); // 多账号之间空一行分隔
@@ -334,14 +342,14 @@ async function runCheckin(env) {
     } else {
       lines.push(`签到结果：❌ 失败（${r.reason}）`);
     }
-  }
-  // 会话到期提醒：剩 3 天以内 ⚠️ 高亮，避免突然失效才发现
-  if (sessionLeft != null) {
-    if (sessionLeft <= 0)
-      lines.push("⚠️ 会话可能已过期：请重新登录 trae.cn，复制新的 X-Cloudide-Session 后运行 npm run deploy");
-    else if (sessionLeft <= 3)
-      lines.push(`⚠️ 会话约剩 ${sessionLeft} 天：请尽快重新登录 trae.cn 更新（复制 Cookie 后 npm run deploy）`);
-    else lines.push(`会话有效期：约剩 ${sessionLeft} 天`);
+    // 会话到期提醒：剩 3 天以内 ⚠️ 高亮，避免突然失效才发现
+    if (r.sessionLeft != null) {
+      if (r.sessionLeft <= 0)
+        lines.push("⚠️ 会话可能已过期：请重新登录 trae.cn，复制新的 X-Cloudide-Session 后运行 npm run deploy");
+      else if (r.sessionLeft <= 3)
+        lines.push(`⚠️ 会话约剩 ${r.sessionLeft} 天：请尽快重新登录 trae.cn 更新（复制 Cookie 后 npm run deploy）`);
+      else lines.push(`会话有效期：约剩 ${r.sessionLeft} 天`);
+    }
   }
   lines.push(`签到时间：${time}`);
   const summary = lines.join("\n");
@@ -359,13 +367,20 @@ async function runCheckin(env) {
 export default {
   // Cron Trigger 入口：每天定时自动执行
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runCheckin(env).then((r) => console.log(r)));
+    ctx.waitUntil(
+      runCheckin(env)
+        .then((r) => console.log(r))
+        .catch((e) => console.error("签到执行失败:", e))
+    );
   },
   // 浏览器访问根路径可手动触发一次，方便测试；
-  // 忽略 /favicon.ico 等浏览器附加请求，避免重复触发签到和推送
+  // 忽略 /favicon.ico 等浏览器附加请求，避免重复触发签到和推送；
+  // 配置 TRIGGER_KEY 后需带 ?key=密钥 访问，防止 URL 泄露被他人触发推送或看到账号信息
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname !== "/") return new Response(null, { status: 204 });
+    if (env.TRIGGER_KEY && url.searchParams.get("key") !== env.TRIGGER_KEY)
+      return new Response(null, { status: 404 });
     const result = await runCheckin(env);
     return new Response(result, {
       headers: { "Content-Type": "text/plain; charset=utf-8" },

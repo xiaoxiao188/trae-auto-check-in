@@ -10,8 +10,9 @@ Trae 每日积分自动签到，部署在 Cloudflare Workers 上，每天定时�
 - 🪪 推送显示真实账号：自动拉取昵称 + 脱敏手机号（如 `张三 138****1234`），拿不到时回退「账号 N」
 - 🛡️ 命中 9074「参与用户太多」风控时自动换设备号重试（最多 5 次）
 - 📢 签到结果推送到钉钉（markdown 消息，支持加签）/ 飞书群机器人，可同时推送；含签到积分和通用积分（剩余额度）
-- ⏳ 会话到期提醒：每天推送显示会话剩余天数，最后 3 天 ⚠️ 高亮（实测接口不续期，更新约 1 分钟）
-- 🖱️ 浏览器访问 Worker URL 可手动触发一次，页面直接显示签到结果和推送诊断
+- ⏳ 会话到期提醒：每天推送显示各账号的会话剩余天数，最后 3 天 ⚠️ 高亮（实测接口不续期，更新约 1 分钟）
+- 🖱️ 浏览器访问 Worker URL 可手动触发一次，页面直接显示签到结果和推送诊断；
+  配置 `TRIGGER_KEY` 后需带 `?key=密钥` 访问，防止 URL 泄露被他人触发
 - 🚫 自动忽略 `/favicon.ico` 等浏览器附加请求，不会重复签到推送
 
 ## 原理
@@ -28,6 +29,7 @@ trae-checkin/
 ├── wrangler.toml     # 定时配置 + 明文变量
 ├── secrets.json      # 密钥默认值（勿提交 Git）
 ├── deploy.mjs        # 交互式部署：逐项确认密钥与触发时间，回车沿用文件值
+├── test/             # 单元测试（npm test）
 └── package.json
 ```
 
@@ -40,7 +42,7 @@ npx wrangler login        # ① 首次使用：弹浏览器点 Allow 授权
 npm run deploy            # ② 交互式部署：确认密钥与触发时间 → 部署代码 + 导入密钥
 ```
 
-`npm run deploy` 会逐项询问三个密钥和定时触发时间：
+`npm run deploy` 会逐项询问各密钥和定时触发时间：
 
 - **直接回车** = 沿用文件中的现有值（密钥来自 `secrets.json`，触发时间来自 `wrangler.toml`）；
 - **输入新值** = 本次部署使用新值，并写回对应文件作为下次默认；触发时间输入北京时间
@@ -62,9 +64,11 @@ npm run deploy            # ② 交互式部署：确认密钥与触发时间 �
 | `TRAE_SESSION` | ✅ | 账号 1 的 `X-Cloudide-Session` Cookie |
 | `TRAE_DEVICE_ID` | | 16 位数字设备号，缺省随机生成 |
 | `TRAE_SESSION_2` / `TRAE_DEVICE_ID_2` … | | 第 2、3… 个账号 |
+| `TRAE_SESSION_DATE` / `TRAE_SESSION_DATE_2` … | | 对应会话的更新日期，`npm run deploy` 更新会话时自动记录 |
 | `DINGTALK_WEBHOOK` | | 钉钉群机器人 Webhook 地址 |
 | `DINGTALK_SECRET` | | 钉钉机器人开启"加签"时的 `SEC` 开头密钥 |
 | `FEISHU_WEBHOOK` | | 飞书机器人 Webhook |
+| `TRIGGER_KEY` | | 手动触发密钥：配置后访问 Worker URL 需带 `?key=<值>`，防止 URL 泄露被他人触发推送 |
 
 飞书和钉钉可以同时配置，会同时推送；都不配置则只在页面/日志输出结果。
 
@@ -77,8 +81,9 @@ npm run deploy            # ② 交互式部署：确认密钥与触发时间 �
 有效期约 **13~14 天**（从浏览器登录时算起）。实测签到接口**不会**自动续期会话（响应不下发新 Cookie，
 换来的 JWT 也只有 8 小时），所以无法做到完全自动更新；脚本采用「到期提醒 + 1 分钟更新」的方案：
 
-- `npm run deploy` 更新 `TRAE_SESSION` 时会自动把日期记入 `TRAE_SESSION_DATE`，此后每天的推送
-  显示「会话有效期：约剩 N 天」，剩 3 天以内 ⚠️ 高亮提醒，不会突然失效才发现；
+- `npm run deploy` 更新 `TRAE_SESSION` 时会自动把日期记入 `TRAE_SESSION_DATE`（多账号对应
+  `TRAE_SESSION_DATE_2` 等），此后每天的推送按账号显示「会话有效期：约剩 N 天」，
+  剩 3 天以内 ⚠️ 高亮提醒，不会突然失效才发现；
 - 更新流程（约 1 分钟）：登录 trae.cn → F12 → Application → Cookies → 复制 `X-Cloudide-Session`
   → `npm run deploy` → 在「Trae 登录凭证」处粘贴新值 → 回车确认部署。
 
@@ -116,13 +121,14 @@ Work 专属积分：0
 > **通用积分** = `endpoint 0` 包剩余之和（TraeCode / TraeWork 均可用）；
 > **Work 专属积分** = `endpoint 1` 包剩余之和（仅 TraeWork 可用）；
 > **总可用积分** = 所有可量化包的剩余之和（免费基础包 `free_xxx` 无额度上限，不计入）；
-> 多账号时每个账号一段，失败账号显示 `❌ 失败（原因）`。
+> 多账号时每个账号一段，失败账号显示 `❌ 失败（原因）`，并各自显示会话剩余天数。
 
 ## 测试
 
-- **手动触发**：访问 Worker 的 URL（`https://trae-checkin.<你的子域>.workers.dev`），
-  页面显示签到结果，底部 `---` 之后是推送诊断（钉钉接口返回的 errcode）；
+- **手动触发**：访问 Worker 的 URL（`https://trae-checkin.<你的子域>.workers.dev`，配置了
+  `TRIGGER_KEY` 时加 `?key=<密钥>`），页面显示签到结果，底部 `---` 之后是推送诊断（钉钉/飞书接口返回）；
 - **本地模拟定时**：`npx wrangler dev --test-scheduled`，然后访问 `http://localhost:8787/__scheduled`；
+- **单元测试**：`npm test`（覆盖 deploy 的 cron 换算、wrangler.toml 写回与交互逻辑）；
 - **查看日志**：`npx wrangler tail`，或控制台 → Workers → trae-checkin → 日志。
 
 ## 常见问题
