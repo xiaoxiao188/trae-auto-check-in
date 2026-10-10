@@ -1,6 +1,7 @@
 // 交互式部署：部署前逐项确认 secrets 与定时触发时间，直接回车 = 沿用文件中的值，
 // 输入新值则覆盖并写回 secrets.json / wrangler.toml（作为下次部署的默认值）。
 // 更新 TRAE_SESSION(_N) 时自动记录更新日期（TRAE_SESSION_DATE(_N)），供 Worker 推送会话剩余天数。
+// TRIGGER_KEY（手动触发鉴权）本地与云端都未配置时自动生成随机 UUID，已有则沿用不覆盖。
 // 全部输入后有一行汇总与最终确认（回车=部署，n=取消），确认前不写文件、不部署。
 // 之后依次执行 wrangler deploy（同步代码与 cron 触发时间）
 // 和 wrangler secret bulk（上传/更新 secrets），
@@ -10,6 +11,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
 
 // 需要确认的变量：[变量名, 中文标签]，提示时中文在前、变量名在后便于对照 README；
 // 变量名是云端/secrets.json 的真实键名，不可翻译；
@@ -19,7 +21,7 @@ const KEYS = [
   ["DINGTALK_WEBHOOK", "钉钉机器人 Webhook"],
   ["DINGTALK_SECRET", "钉钉加签密钥"],
   ["FEISHU_WEBHOOK", "飞书机器人 Webhook"],
-  ["TRIGGER_KEY", "手动触发密钥(可选)"],
+  ["TRIGGER_KEY", "手动触发密钥"],
 ];
 // 可选：通过参数指定其他 secrets 文件，如 node deploy.mjs secrets.test.json
 const SECRETS_FILE = process.argv[2] || "secrets.json";
@@ -30,6 +32,26 @@ const BJ_OFFSET_MIN = 8 * 60;
 // 展示用：截断长值，避免整段密钥刷屏
 const preview = (v) =>
   typeof v === "string" && v.length > 12 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v || "";
+
+// 云端已配置的 Secret 名单（wrangler 只能看名字、读不到值，仅用于判断存在性）。
+// 查询失败（未登录 / 首次部署 Worker 尚不存在 / 离线）视为空集，TRIGGER_KEY 走自动生成
+function listRemoteSecretNames() {
+  try {
+    // 必须用单字符串命令 + shell：args 数组与 shell 同用会触发 Node 的 DEP0190 弃用警告
+    const r = spawnSync("npx wrangler secret list", {
+      encoding: "utf8",
+      shell: true,
+      timeout: 60_000,
+      stdio: ["ignore", "pipe", "pipe"], // 不占用 stdin，避免与交互询问冲突
+    });
+    const start = r.stdout.indexOf("[");
+    const end = r.stdout.lastIndexOf("]");
+    if (r.status !== 0 || start < 0 || end < start) return new Set();
+    return new Set(JSON.parse(r.stdout.slice(start, end + 1)).map((s) => s.name));
+  } catch {
+    return new Set();
+  }
+}
 
 // 每日定时 cron（"M H * * *"，UTC）↔ 北京时间 HH:MM 互转；非每日定时的 cron 返回 null
 export const cronToBeijing = (cron) => {
@@ -88,13 +110,20 @@ export function createAsker(rl) {
 
 // 交互收集阶段（导出供测试）：逐项询问密钥与触发时间，最后汇总确认。
 // 注意：所有询问完成后由调用方关闭 rl；此函数不写任何文件。
-// 新值直接记录在传入的 secrets 上；返回 { confirmed, changedKeys, newCron }
-export async function collectChanges(ask, secrets, curCron) {
+// 新值直接记录在传入的 secrets 上；remoteSecrets 为云端已有 Secret 名单（用于 TRIGGER_KEY 提示）；
+// 返回 { confirmed, changed, changedKeys, newCron }
+export async function collectChanges(ask, secrets, curCron, remoteSecrets = new Set()) {
   const before = { ...secrets };
   console.log("部署前确认（直接回车 = 沿用文件中的现有值）：");
   for (const [key, label] of KEYS) {
     const cur = secrets[key] || "";
-    const tip = cur ? `回车=沿用 ${preview(cur)}` : "文件中暂无此值，回车=跳过";
+    let tip;
+    if (cur) tip = `回车=沿用 ${preview(cur)}`;
+    else if (key === "TRIGGER_KEY")
+      tip = remoteSecrets.has(key)
+        ? "云端已配置（值不可读取），回车=沿用云端"
+        : "回车=自动生成随机密钥";
+    else tip = "文件中暂无此值，回车=跳过";
     const ans = (await ask(`${label} ${key}（${tip}）: `)).trim();
     if (ans) secrets[key] = ans;
   }
@@ -162,15 +191,35 @@ if (isMain) {
     .replace(/["']/g, "")
     .trim();
 
+  // 云端已有 Secret 名单：仅用于 TRIGGER_KEY 的存在性判断。
+  // 只在本地未配置 TRIGGER_KEY 时才查询（需联网，可能耗时数秒）；已有则无需关心云端状态
+  let remoteSecrets = new Set();
+  if (!secrets.TRIGGER_KEY) {
+    console.log("查询云端已配置的 Secret…");
+    remoteSecrets = listRemoteSecretNames();
+  }
+
   // 所有询问结束后才关闭输入流（此前版本提前关闭，导致触发时间询问被跳过）
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const ask = createAsker(rl);
-  const { confirmed, changed, newCron } = await collectChanges(ask, secrets, curCron);
+  const { confirmed, changed, newCron } = await collectChanges(ask, secrets, curCron, remoteSecrets);
   rl.close();
 
   if (!confirmed) {
     console.log("已取消：未修改任何文件、未部署");
     process.exit(0);
+  }
+
+  // TRIGGER_KEY 三种情况：本地有 → 沿用；本地无但云端有 → 沿用云端不覆盖（值不可读取）；
+  // 两边都没有 → 自动生成随机密钥并随本次部署上传
+  let triggerKeyNote = "";
+  if (!secrets.TRIGGER_KEY) {
+    if (remoteSecrets.has("TRIGGER_KEY"))
+      triggerKeyNote = "TRIGGER_KEY：云端已配置，沿用云端值（如需更换，部署时输入新密钥）";
+    else {
+      secrets.TRIGGER_KEY = randomUUID();
+      triggerKeyNote = `已自动生成 TRIGGER_KEY：${secrets.TRIGGER_KEY}（手动访问 Worker URL 需带 ?key=此值）`;
+    }
   }
 
   // 更新 TRAE_SESSION(_N) 时同步记录该会话的更新日期（存入 secrets.json 一并 bulk 上传），
@@ -207,9 +256,12 @@ if (isMain) {
   }
   if (dateNotes.length)
     console.log("会话更新日期已记录：" + dateNotes.join("，"));
+  if (triggerKeyNote) console.log(triggerKeyNote);
 
+  const q = (a) => (/[\s"]/.test(a) ? `"${a}"` : a);
   const run = (args) => {
-    const r = spawnSync("npx", args, { stdio: "inherit", shell: true });
+    // 单字符串命令 + shell，避免 args 数组触发 DEP0190 警告
+    const r = spawnSync(["npx", ...args].map(q).join(" "), { stdio: "inherit", shell: true });
     if (r.status !== 0) process.exit(r.status ?? 1);
   };
 

@@ -64,6 +64,26 @@ test("collectChanges：全部回车沿用现有值", async () => {
   assert.deepEqual(secrets, { TRAE_SESSION: "s1" });
 });
 
+test("collectChanges：TRIGGER_KEY 两边都没有时提示自动生成", async () => {
+  const prompts = [];
+  const secrets = {};
+  await collectChanges((p) => (prompts.push(p), ""), secrets, "05 2 * * *");
+  assert.match(prompts[0], /文件中暂无此值，回车=跳过/);
+  assert.match(prompts[4], /回车=自动生成随机密钥/);
+  assert.deepEqual(secrets, {});
+});
+
+test("collectChanges：云端已有 TRIGGER_KEY 时提示沿用云端", async () => {
+  const prompts = [];
+  await collectChanges(
+    (p) => (prompts.push(p), ""),
+    {},
+    "05 2 * * *",
+    new Set(["TRIGGER_KEY"])
+  );
+  assert.match(prompts[4], /云端已配置/);
+});
+
 test("collectChanges：输入新密钥与新触发时间", async () => {
   const secrets = { TRAE_SESSION: "old" };
   // 5 个密钥项 + 触发时间 + 最终确认
@@ -74,3 +94,5 @@ test("collectChanges：输入新密钥与新触发时间", async () => {
   assert.equal(res.newCron, "30 0 * * *");
   assert.equal(secrets.TRAE_SESSION, "new-session");
 });
+
+
