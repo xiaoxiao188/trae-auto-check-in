@@ -9,7 +9,7 @@ import {
   rawSigToDer,
   CLIENT_PARAMS,
 } from "../src/trae-auth.js";
-import { iterAccounts } from "../src/index.js";
+import { iterAccounts, buildFeishuCard } from "../src/index.js";
 
 // 按逆向出的算法构造加密密文（decryptAuthBlob 的逆），用于往返测试
 function encryptAuthBlob(obj) {
@@ -118,4 +118,50 @@ test("iterAccounts：两种凭证共存时同一编号只算一个账号", () =>
   assert.equal(withExpiry.accounts[0].sessionDate, "2026-10-09");
   // 中间断号仍记入 gaps
   assert.deepEqual(iterAccounts({ TRAE_SESSION: "s", TRAE_SESSION_3: "s3" }).gaps, [2]);
+});
+
+test("buildFeishuCard：标题进 header、时间进 note、标签加粗状态着色", () => {
+  const lines = [
+    "Trae 自动签到",
+    "账号：stars 175******08",
+    "签到结果：✅ 成功",
+    "签到积分：+150",
+    "通用积分：4825.49",
+    "会话有效期：约剩 9 天",
+    "签到时间：2026-10-14 10:05:05",
+  ];
+  const card = buildFeishuCard(lines);
+  assert.equal(card.header.title.content, "Trae 自动签到");
+  assert.equal(card.header.template, "green"); // 全成功 → 绿
+  const md = card.elements[0].text.content;
+  assert.ok(md.includes("**账号：**stars 175******08"));
+  assert.ok(md.includes("<font color='green'>✅ 成功</font>"));
+  assert.ok(!md.includes("签到时间")); // 时间不进正文
+  assert.equal(
+    card.elements[2].elements[0].content,
+    "签到时间：2026-10-14 10:05:05"
+  );
+  // 多账号空行保留为段落间距
+  assert.ok(
+    buildFeishuCard(["t", "账号：A", "", "账号：B", "时间：x"]).elements[0].text.content.includes("\n\n")
+  );
+});
+
+test("buildFeishuCard：含失败标题栏红色、含警告橙色", () => {
+  assert.equal(
+    buildFeishuCard(["t", "签到结果：❌ 失败（x）", "时间：x"]).header.template,
+    "red"
+  );
+  assert.equal(
+    buildFeishuCard(["t", "⚠️ 编号 2 的账号凭证缺失", "时间：x"]).header.template,
+    "orange"
+  );
+  // 失败 + 警告并存 → 红色优先
+  assert.equal(
+    buildFeishuCard(["t", "⚠️ 提醒", "签到结果：❌ 失败", "时间：x"]).header.template,
+    "red"
+  );
+  // 失败值着红
+  const md = buildFeishuCard(["t", "签到结果：❌ 失败（原因）", "时间：x"]).elements[0].text.content;
+  assert.ok(md.includes("<font color='red'>❌ 失败（原因）</font>"));
 });

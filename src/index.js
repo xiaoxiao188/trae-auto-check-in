@@ -197,14 +197,47 @@ const randomDeviceId = () => {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function notifyFeishu(webhook, text) {
+// 飞书推送用卡片（msg_type=interactive）：标题进卡片 header（成功绿/警告橙/失败红），
+// 正文用 lark_md（标签加粗、✅绿 ❌红），时间戳进 note 小字。
+// 注意飞书 markdown 子集与钉钉不同：不支持 # 标题、<font> 仅支持 green/red/grey
+export function buildFeishuCard(lines) {
+  const hasFail = lines.some((l) => l.includes("❌"));
+  const hasWarn = lines.some((l) => l.includes("⚠️"));
+  const body = lines
+    .slice(1, -1) // 首行标题 → header；末行签到时间 → note
+    .map((line) => {
+      const m = line.match(/^([^：]+)：(.+)$/);
+      if (!m) return line;
+      const [, label, value] = m;
+      let v = value;
+      if (value.includes("✅")) v = `<font color='green'>${value}</font>`;
+      else if (value.includes("❌")) v = `<font color='red'>${value}</font>`;
+      return `**${label}：**${v}`;
+    })
+    .join("\n");
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: hasFail ? "red" : hasWarn ? "orange" : "green",
+      title: { tag: "plain_text", content: lines[0] },
+    },
+    elements: [
+      { tag: "div", text: { tag: "lark_md", content: body } },
+      { tag: "hr" },
+      { tag: "note", elements: [{ tag: "plain_text", content: lines[lines.length - 1] }] },
+    ],
+  };
+}
+
+// 飞书推送：卡片消息（interactive），比纯文本清晰
+async function notifyFeishu(webhook, card) {
   webhook = (webhook || "").trim();
   if (!webhook) return null;
   try {
     const resp = await fetch(webhook, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ msg_type: "text", content: { text } }),
+      body: JSON.stringify({ msg_type: "interactive", card }),
     });
     return `飞书：HTTP ${resp.status} ${await resp.text()}`;
   } catch (e) {
@@ -453,10 +486,11 @@ async function runCheckin(env) {
   lines.push(`签到时间：${time}`);
   const summary = lines.join("\n");
   // 钉钉用 markdown 推送：标题加粗（#### **标题**），标题下用 --- 分割线实现下划线效果；
-  // markdown 单换行会折叠，行与行之间用空行分隔
+  // markdown 单换行会折叠，行与行之间用空行分隔；
+  // 飞书用卡片推送（buildFeishuCard），与钉钉同样排版但支持颜色（成功绿/失败红）
   const mdSummary = `#### **${lines[0]}**\n\n---\n\n` + lines.slice(1).join("\n\n");
   const pushResults = await Promise.all([
-    notifyFeishu(env.FEISHU_WEBHOOK, summary),
+    notifyFeishu(env.FEISHU_WEBHOOK, buildFeishuCard(lines)),
     notifyDingTalk(env.DINGTALK_WEBHOOK, env.DINGTALK_SECRET, lines[0], mdSummary),
   ]);
   const pushInfo = pushResults.filter(Boolean).join("\n");
