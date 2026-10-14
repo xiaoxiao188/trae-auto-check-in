@@ -5,31 +5,41 @@ Trae 每日积分自动签到，部署在 Cloudflare Workers 上，每天定时�
 
 ## 功能特性
 
+- 🔑 **自动续期模式（推荐）**：从本机 Trae 客户端一键提取 RefreshToken（约半年有效），Worker 每天自动换新 JWT，无需再抓 Cookie；到期前推送提醒
 - 🕐 每天定时自动签到（Cron Trigger，默认北京时间 10:05，部署时可修改）
 - 👥 多账号支持（`TRAE_SESSION_2`、`TRAE_SESSION_3`……），编号不连续（如漏配 `_2`）时推送中会提示，避免悄悄漏配
 - 🪪 推送显示真实账号：自动拉取昵称 + 脱敏手机号（如 `张三 138****1234`），拿不到时回退「账号 N」
 - 🛡️ 命中 9074「参与用户太多」风控时自动换设备号重试（最多 5 次）
 - 🔁 网络瞬断或上游 5xx 自动重试（最多 3 次、间隔递增），偶发抖动不致错过当日签到
 - 📢 签到结果推送到钉钉（markdown 消息，支持加签）/ 飞书群机器人，可同时推送；含签到积分和通用积分（剩余额度）
-- ⏳ 会话到期提醒：每天推送显示各账号的会话剩余天数，最后 3 天 ⚠️ 高亮（实测接口不续期，更新约 1 分钟）
+- ⏳ 凭证到期提醒：每天推送显示各账号的凭证剩余天数，临期 ⚠️ 高亮（续期凭证约半年一换，Cookie 会话约 13 天一换）
 - 🖱️ 浏览器访问 Worker URL 可手动触发一次，页面直接显示签到结果和推送诊断；
   配置 `TRIGGER_KEY` 后需带 `?key=密钥` 访问（本地与云端都未配置时部署脚本自动生成）
 - 🚫 自动忽略 `/favicon.ico` 等浏览器附加请求，不会重复签到推送
 
 ## 原理
 
-移植自 [TraeTools](https://github.com/star620/TraeTools) 的 `checkin.py`：
-用 `X-Cloudide-Session` Cookie 调用 `GetUserToken` 换取新 JWT，再调用签到接口。
-全程仅 HTTP 请求，非常适合 Cloudflare Workers（免费额度完全够用）。
+移植自 [TraeTools](https://github.com/star620/TraeTools) 的 `checkin.py`，签到与续期接口逆向自 Trae 客户端（参考
+[qilimixingkong/trae-checkin](https://github.com/qilimixingkong/trae-checkin)、[magpie#808](https://github.com/yetone/magpie/issues/808)）：
+
+- **续期模式**：本机 Trae 客户端登录后，`npm run extract` 从其 `storage.json` 解密出 RefreshToken
+  （约半年有效）和设备 ECDSA P-256 密钥对；Worker 每天用密钥对给
+  `/trae/api/v3/oauth/ExchangeToken` 签名换新 JWT（绑定了设备，签到不触发 9074 风控）。
+  实测该接口返回新 RefreshToken 但**不作废旧值**，不影响客户端自身登录态；
+- **Cookie 模式**：用 `X-Cloudide-Session` Cookie 调 `GetUserToken` 换新 JWT（约 13 天过期，需手动更新）。
+
+两种模式可共存：配了 RefreshToken 的账号优先用续期模式，失败自动回退 Cookie 模式。
 
 ## 项目结构
 
 ```
 trae-checkin/
-├── src/index.js      # Worker 主代码（签到 + 推送）
+├── src/index.js      # Worker 主代码（签到 + 推送，两种凭证模式）
+├── src/trae-auth.js  # 凭证续期核心（storage.json 解密 + ExchangeToken 签名）
 ├── wrangler.toml     # 定时配置 + 明文变量
 ├── secrets.json      # 密钥默认值（勿提交 Git）
 ├── deploy.mjs        # 交互式部署：逐项确认密钥与触发时间，回车沿用文件值
+├── extract.mjs        # 从本机 Trae 客户端提取续期凭证写入 secrets.json
 ├── test/             # 单元测试（npm test）
 └── package.json
 ```
@@ -40,8 +50,12 @@ trae-checkin/
 cd D:\projects\cline\trae-checkin
 npm install
 npx wrangler login        # ① 首次使用：弹浏览器点 Allow 授权
-npm run deploy            # ② 交互式部署：确认密钥与触发时间 → 部署代码 + 导入密钥
+npm run deploy            # ② 自动提取续期凭证 + 交互式部署（确认密钥与触发时间）
 ```
+
+`npm run deploy` 部署前会**自动从本机 Trae 客户端提取续期凭证**（检测到已登录客户端才执行，
+验证可用后随部署一并上传；没有客户端则跳过，Cookie 模式不受影响），因此每次部署都会
+自动保鲜 RefreshToken——**约半年一次的凭证更新同样只需 `npm run deploy` 这一条命令**。
 
 `npm run deploy` 会逐项询问各密钥和定时触发时间：
 
@@ -64,10 +78,13 @@ npm run deploy            # ② 交互式部署：确认密钥与触发时间 �
 
 | Secret | 必填 | 说明 |
 |---|---|---|
-| `TRAE_SESSION` | ✅ | 账号 1 的 `X-Cloudide-Session` Cookie |
+| `TRAE_REFRESH_TOKEN` | ✅ | 账号 1 的 RefreshToken（`npm run extract` 自动写入，约半年有效） |
+| `TRAE_DEVICE` | ✅ | 设备密钥对与指纹 JSON（`npm run extract` 自动写入，机器级各账号共用） |
+| `TRAE_SESSION` | | 账号 1 的 `X-Cloudide-Session` Cookie（Cookie 模式 / 续期失败兜底） |
 | `TRAE_DEVICE_ID` | | 16 位数字设备号，缺省随机生成 |
-| `TRAE_SESSION_2` / `TRAE_DEVICE_ID_2` … | | 第 2、3… 个账号 |
-| `TRAE_SESSION_DATE` / `TRAE_SESSION_DATE_2` … | | 对应会话的更新日期，`npm run deploy` 更新会话时自动记录 |
+| `TRAE_REFRESH_TOKEN_2` / `TRAE_SESSION_2` … | | 第 2、3… 个账号（两种模式按编号对应） |
+| `TRAE_REFRESH_EXPIRY` / `TRAE_SESSION_DATE` … | | 对应凭证的到期/更新日期，提取/部署时自动记录，用于剩余天数提醒 |
+| `TRAE_REFRESH_LABEL` … | | 续期模式的账号展示名（提取时记录的昵称 + 脱敏手机号） |
 | `DINGTALK_WEBHOOK` | | 钉钉群机器人 Webhook 地址 |
 | `DINGTALK_SECRET` | | 钉钉机器人开启"加签"时的 `SEC` 开头密钥 |
 | `FEISHU_WEBHOOK` | | 飞书机器人 Webhook |
@@ -77,12 +94,38 @@ npm run deploy            # ② 交互式部署：确认密钥与触发时间 �
 
 ⚠️ **不要把密钥写进 `wrangler.toml`**，那里是明文的，会泄露账号凭证。
 
-## 获取 TRAE_SESSION
+## 启用自动续期（推荐，一次管半年）
+
+前提：本机装了 **Trae CN / TRAE SOLO CN** 客户端并登录了要签到的账号。然后正常
+`npm run deploy` 即可——部署脚本自动完成提取、验证、上传，无需任何额外步骤。
+
+自动提取做了什么：解密客户端 `storage.json` → 取出 RefreshToken（约半年有效）和设备
+ECDSA 密钥对 → 真实调用一次 ExchangeToken 验证（该接口不轮换不作废旧值，不影响客户端
+登录态）→ 写入 `secrets.json` 的 `TRAE_DEVICE` / `TRAE_REFRESH_TOKEN` /
+`TRAE_REFRESH_EXPIRY` / `TRAE_REFRESH_LABEL` 并随部署上传。
+
+推送中会显示「凭证模式：自动续期（约剩 N 天）」，剩 14 天内 ⚠️ 提醒刷新；刷新 = 在客户端
+登录该账号后重跑 `npm run deploy`（一条命令完成）。
+
+需要单独操作时（不部署）：
+
+- `npm run extract`：只提取写入 `secrets.json` 不部署（之后 `npm run secrets` 上传）；
+- `npm run extract -- --account 2`：写入其他账号编号（部署自动提取固定写账号 1）。
+
+注意事项：
+
+- RefreshToken 与客户端登录态同源：在客户端里**切换到其他账号会吊销已提取的凭证**
+  （社区实测），切换后需重新登录原账号再 `npm run extract`；
+- 凭证过期后若配置了同编号的 `TRAE_SESSION`，会自动回退 Cookie 模式继续签到，不会漏签；
+- 仅支持 Windows（读取 `%APPDATA%` 下客户端数据）；解密算法随客户端更新可能失效
+  （报「密文头部不符合预期」时需重新逆向）。
+
+## 获取 TRAE_SESSION（Cookie 模式，可选）
 
 浏览器登录 <https://www.trae.cn> → F12 → Application（应用）→ Cookies → 复制 `X-Cloudide-Session` 的值。
 
-有效期约 **13~14 天**（从浏览器登录时算起）。实测签到接口**不会**自动续期会话（响应不下发新 Cookie，
-换来的 JWT 也只有 8 小时），所以无法做到完全自动更新；脚本采用「到期提醒 + 1 分钟更新」的方案：
+有效期约 **13~14 天**（从浏览器登录时算起），需定期手动更新，建议仅在无法使用自动续期模式
+（如非 Windows、客户端解密失效）时选用。脚本采用「到期提醒 + 1 分钟更新」的方案：
 
 - `npm run deploy` 更新 `TRAE_SESSION` 时会自动把日期记入 `TRAE_SESSION_DATE`（多账号对应
   `TRAE_SESSION_DATE_2` 等），此后每天的推送按账号显示「会话有效期：约剩 N 天」，
@@ -111,12 +154,13 @@ Trae 自动签到
 通用积分：4825.49
 Work 专属积分：0
 总可用积分：4825.49
-会话有效期：约剩 9 天
-签到时间：2026-09-23 08:30:05
+凭证模式：自动续期（约剩 170 天）
+签到时间：2026-10-13 10:05:05
 ```
 
-> 账号名来自 `/cloudide/api/v3/trae/GetUserInfo`（昵称 + 官方已脱敏的手机号，
-> 逆向自 www.trae.cn/dashboard），拉取失败不影响签到，回退显示「账号 N」。
+> 账号名：续期模式取自提取时记录的昵称 + 官方脱敏手机号；Cookie 模式来自
+> `/cloudide/api/v3/trae/GetUserInfo`（该接口需要 Cookie，续期模式下不可用）。拉取失败
+> 不影响签到，回退显示「账号 N」。
 
 > 签到积分 = **本次签到实际入账**的积分（优先取 claim 返回值；claim 不带分时取当日「签到奖励」积分包额度。
 > 每天首次执行前先查签到状态，已签过则跳过签到接口，显示 `+0（今日已签到）`）；
@@ -131,7 +175,7 @@ Work 专属积分：0
 - **手动触发**：访问 Worker 的 URL（`https://trae-checkin.<你的子域>.workers.dev`，配置了
   `TRIGGER_KEY` 时加 `?key=<密钥>`），页面显示签到结果，底部 `---` 之后是推送诊断（钉钉/飞书接口返回）；
 - **本地模拟定时**：`npx wrangler dev --test-scheduled`，然后访问 `http://localhost:8787/__scheduled`；
-- **单元测试**：`npm test`（覆盖 deploy 的 cron 换算、wrangler.toml 写回与交互逻辑）；
+- **单元测试**：`npm test`（覆盖 deploy 的 cron 换算与交互逻辑、凭证解密与签名转换）；
 - **查看日志**：`npx wrangler tail`，或控制台 → Workers → trae-checkin → 日志。
 
 ## 常见问题
@@ -143,13 +187,16 @@ Work 专属积分：0
 | `keywords not in content` | 机器人设了关键词但消息没包含，把关键词改成 `Trae` |
 | 每次推送两条 | 旧版本被 `/favicon.ico` 重复触发，更新代码重新部署即可；另检查控制台「触发器」是否有重复的 Cron |
 | `签到结果：✅ 成功（今日已签到）` `签到积分：+0` | 当天已签过，重复签到不加分，属正常 |
-| 签到失败 `会话已失效(401)` | Session 过期（约 13~14 天），登录 trae.cn 重新抓 Cookie，`npm run deploy` 更新（推送里平时就有剩余天数提醒） |
+| 签到失败 `会话已失效(401)` | Cookie 模式的 Session 过期（约 13~14 天），登录 trae.cn 重新抓 Cookie，`npm run deploy` 更新 |
+| 签到失败 `自动续期失败（10101 ...）` | RefreshToken 失效（过期 / 客户端切换过账号 / 解密常量过期），在客户端登录该账号后 `npm run extract` + `npm run deploy` |
+| `extract` 报 `密文头部不符合预期` | 客户端更新了加密方案，需重新逆向（参考 [qilimixingkong/trae-checkin](https://github.com/qilimixingkong/trae-checkin) TECH_DESIGN §6.4），期间可退回 Cookie 模式 |
 | 签到失败 `9074 参与用户太多` | 风控，脚本已自动换设备号重试；仍失败可把 cron 调到冷门时段（如北京凌晨） |
 
 ## 日常维护
 
 - **改了代码 / 定时时间** → `npm run deploy`，部署完成后自动触发一次签到并显示结果；
-- **Session 过期更新** → `npm run deploy` 在「Trae 登录凭证」处输入新值（自动记录更新日期，提醒才准确）；
+- **续期凭证更新（约半年一次）** → 客户端登录该账号后 `npm run deploy`（自动重新提取上传，推送剩 14 天内会 ⚠️ 提醒）；
+- **Session 过期更新（Cookie 模式）** → `npm run deploy` 在「Trae 登录凭证」处输入新值（自动记录更新日期，提醒才准确）；
 - **只改其他密钥**（钉钉 / 飞书）→ 改 `secrets.json` 后 `npm run secrets`，无需部署；
 - `secrets.json` 已在 `.gitignore` 中排除，不会误提交；若清空了真实值，下次部署时对应项
   会提示「文件中暂无此值」，回车 = 跳过不上传（云端保留旧值），输入新值则上传并写回。
@@ -170,6 +217,6 @@ crons = ["30 0 * * *"]   # UTC 时间，北京时间 = UTC+8
 
 ## 免责声明
 
-本项目与 ByteDance / Trae 官方无任何关系。签到接口为逆向的非公开接口，字段可能随官方更新变化；
+本项目与 ByteDance / Trae 官方无任何关系。签到与续期接口均为逆向的非公开接口，字段可能随官方更新变化；
 使用自动签到请遵守 Trae 服务条款，风险自负。账号凭证仅保存在你自己的 Cloudflare 账号中。
 

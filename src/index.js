@@ -1,19 +1,32 @@
-const BASE = "https://api.trae.cn";
+import { BASE, REFRESH_UA, renewToken } from "./trae-auth.js";
 
 // 会话（X-Cloudide-Session）有效期实测约 13 天出头，从浏览器登录时算起；
 // 按 13 天估算剩余天数（宁早勿晚），用于到期提醒
 const SESSION_TTL_DAYS = 13;
+// RefreshToken 有效期约半年（实测 180 天），剩 14 天内提醒重新提取
+const REFRESH_WARN_DAYS = 14;
 
 const bjNow = () => new Date(Date.now() + 8 * 3600e3); // 北京时间（UTC+8，不受运行环境时区影响）
 
-// 签到相关接口的公共鉴权头
-const authHeaders = (token, deviceId) => ({
+// 签到相关接口的公共鉴权头。refresh 模式仿真实客户端（Electron UA + 全套设备头 +
+// body 带 req_source），否则会被判为脚本触发 9074（magpie#808 实测）
+const authHeaders = (token, deviceId, mode = "cookie") => ({
   "Authorization": "Cloud-IDE-JWT " + token,
   "X-User-Region": "cn",
   "x-device-id": deviceId,
   "Content-Type": "application/json",
-  "User-Agent": "TraeCheckin/1.0",
+  ...(mode === "refresh"
+    ? {
+        "User-Agent": REFRESH_UA,
+        "x-device-brand": "LENOVO 82XW",
+        "x-device-type": "Windows",
+        "x-os-version": "10.0.26100",
+        "x-app-version": "0.1.64",
+      }
+    : { "User-Agent": "TraeCheckin/1.0" }),
 });
+// 签到接口请求体：客户端发 {req_source:1}，Cookie 模式沿用原 {}
+const apiBody = (mode) => (mode === "refresh" ? '{"req_source":1}' : "{}");
 
 // POST 请求：网络异常或上游 5xx 时自动重试（共 3 次，间隔递增），避免 cron 当天
 // 一次网络抖动就错过签到；4xx 属业务错误（401 失效、风控等）不重试，直接返回
@@ -53,11 +66,11 @@ async function getToken(session) {
   return token;
 }
 
-async function checkin(token, deviceId) {
+async function checkin(token, deviceId, mode = "cookie") {
   const { status, text } = await post(
     "/trae/api/v2/ug/checkin_credits/claim",
-    authHeaders(token, deviceId),
-    "{}"
+    authHeaders(token, deviceId, mode),
+    apiBody(mode)
   );
   let body;
   try {
@@ -70,12 +83,12 @@ async function checkin(token, deviceId) {
 
 // 查询今日签到状态（用于判断「今日已签到」）。注意：extra_credits 只是
 // 「可额外获得」，并未随签到入账（额度包记录证实每日签到实际入账 = credits）
-async function getCheckinStatus(token, deviceId) {
+async function getCheckinStatus(token, deviceId, mode = "cookie") {
   try {
     const { status, text } = await post(
       "/trae/api/v2/ug/checkin_credits/status",
-      authHeaders(token, deviceId),
-      "{}"
+      authHeaders(token, deviceId, mode),
+      apiBody(mode)
     );
     if (status !== 200) return null;
     return JSON.parse(text);
@@ -90,11 +103,11 @@ async function getCheckinStatus(token, deviceId) {
 // general = Σ(通用包剩余)，work = Σ(Work专属包剩余)，total = 全部可量化包的剩余之和
 // todayCheckin = 今日签到实际入账（entitlement_id 形如 checkin_20260922_xxx 的包额度）
 // 注意：free_xxx 基础免费包没有 credits_limit（不可量化），不计入任何汇总
-async function getCredits(token, deviceId) {
+async function getCredits(token, deviceId, mode = "cookie") {
   try {
     const { status, text } = await post(
       "/trae/api/v2/pay/web_user_ent_usage",
-      authHeaders(token, deviceId),
+      authHeaders(token, deviceId, mode),
       "{}"
     );
     if (status !== 200) return null;
@@ -246,13 +259,15 @@ async function notifyDingTalk(webhook, secret, title, mdText) {
   }
 }
 
-// 读取 TRAE_SESSION（账号 1）、TRAE_SESSION_2、TRAE_SESSION_3 … 及各自的设备号与更新日期。
-// 不在首个缺失编号处停止：中间断号（如只配 _3 未配 _2）的账号仍会签到，
+// 读取各账号凭证：Cookie 模式 TRAE_SESSION（账号 1）、TRAE_SESSION_2、… 与
+// 续期模式 TRAE_REFRESH_TOKEN（账号 1）、TRAE_REFRESH_TOKEN_2、…（两者可共存，续期优先），
+// 及各自的设备号与日期。不在首个缺失编号处停止：中间断号的账号仍会签到，
 // 缺失编号记入 gaps 由调用方在推送中提示，避免悄悄漏签
-function iterAccounts(env) {
+export function iterAccounts(env) {
   const nums = [];
-  if (env.TRAE_SESSION) nums.push(1);
-  for (let n = 2; n <= 99; n++) if (env[`TRAE_SESSION_${n}`]) nums.push(n);
+  if (env.TRAE_SESSION || env.TRAE_REFRESH_TOKEN) nums.push(1);
+  for (let n = 2; n <= 99; n++)
+    if (env[`TRAE_SESSION_${n}`] || env[`TRAE_REFRESH_TOKEN_${n}`]) nums.push(n);
   const gaps = [];
   for (let n = 1; n < nums[nums.length - 1]; n++)
     if (!nums.includes(n)) gaps.push(n);
@@ -262,7 +277,10 @@ function iterAccounts(env) {
       const suffix = n === 1 ? "" : `_${n}`;
       return {
         name: `账号 ${n}`,
-        session: env[`TRAE_SESSION${suffix}`],
+        session: env[`TRAE_SESSION${suffix}`] || "",
+        refreshToken: env[`TRAE_REFRESH_TOKEN${suffix}`] || "",
+        refreshExpiry: env[`TRAE_REFRESH_EXPIRY${suffix}`] || "",
+        refreshLabel: env[`TRAE_REFRESH_LABEL${suffix}`] || "",
         deviceId: env[`TRAE_DEVICE_ID${suffix}`] || "",
         sessionDate: env[`TRAE_SESSION_DATE${suffix}`] || "",
       };
@@ -279,28 +297,67 @@ function sessionLeftDays(sessionDate) {
   return SESSION_TTL_DAYS - Math.floor(ms / 86400e3);
 }
 
+// RefreshToken 剩余天数：按提取时记录的到期日（TRAE_REFRESH_EXPIRY）计算，未知返回 null
+function refreshLeftDays(expiry) {
+  if (!expiry) return null;
+  const ms = Date.parse(expiry + "T00:00:00+08:00") - bjNow();
+  if (!Number.isFinite(ms)) return null;
+  return Math.floor(ms / 86400e3);
+}
+
 async function runCheckin(env) {
   const { accounts, gaps } = iterAccounts(env);
-  if (!accounts.length) return "缺少环境变量 TRAE_SESSION";
+  if (!accounts.length) return "缺少环境变量 TRAE_SESSION 或 TRAE_REFRESH_TOKEN";
+
+  // 续期模式的设备密钥对（TRAE_DEVICE，机器级各账号共用）；缺失或损坏时相关账号回退 Cookie 模式
+  let device = null;
+  if (env.TRAE_DEVICE) {
+    try {
+      device = JSON.parse(env.TRAE_DEVICE);
+    } catch {}
+    if (!device?.PrivateKey || !device?.DeviceID || !device?.DevicePublicKey) device = null;
+  }
 
   const results = [];
   for (const [i, acc] of accounts.entries()) {
     if (i > 0) await sleep(3000 + Math.random() * 3000); // 多账号错开，规避风控
     let deviceId = acc.deviceId || randomDeviceId();
-    let name = acc.name;
+    // 续期模式无 Cookie，GetUserInfo 不可用（401），用提取时记录的昵称兜底
+    let name = acc.refreshLabel || acc.name;
+    let mode = acc.refreshToken && device ? "refresh" : "cookie";
     try {
-      const token = await getToken(acc.session);
+      let token;
+      if (mode === "refresh") {
+        const r = await renewToken(acc.refreshToken, device);
+        if (r.ok) {
+          token = r.token;
+        } else if (acc.session) {
+          token = await getToken(acc.session); // 续期失败回退 Cookie 模式
+          mode = "cookie";
+        } else {
+          throw new Error(
+            `自动续期失败（${r.code ?? ""} ${r.error}）：请运行 npm run extract 重新提取`
+          );
+        }
+      } else {
+        token = await getToken(acc.session);
+      }
       // 昵称与今日签到状态相互独立，并行查询省一个来回
       const [info, st0] = await Promise.all([
-        getUserInfo(token, acc.session),
-        getCheckinStatus(token, deviceId),
+        mode === "cookie" ? getUserInfo(token, acc.session) : null,
+        getCheckinStatus(token, deviceId, mode),
       ]);
-      name = displayLabel(acc, info);
+      if (mode === "cookie") {
+        // 接口拿到昵称才覆盖（GetUserInfo 失败时保留提取时记录的标签）
+        const live = displayLabel(acc, info);
+        if (live !== acc.name) name = live;
+      }
       // 今日已签到则跳过 claim，直接显示 +0（避免重复请求触发风控）
       if (st0?.checked_in) {
-        const usage = await getCredits(token, deviceId);
+        const usage = await getCredits(token, deviceId, mode);
         results.push({
           name,
+          mode,
           ok: true,
           earned: 0,
           already: true,
@@ -310,23 +367,24 @@ async function runCheckin(env) {
         });
         continue;
       }
-      let result = await checkin(token, deviceId);
+      let result = await checkin(token, deviceId, mode);
       let code = result.body?.code ?? -1;
       // 9074「参与用户太多」→ 换新设备号重试，最多 5 次
       for (let attempt = 1; code === 9074 && attempt < 5; attempt++) {
         deviceId = randomDeviceId();
         await sleep(800 + Math.random() * 700);
-        result = await checkin(token, deviceId);
+        result = await checkin(token, deviceId, mode);
         code = result.body?.code ?? -1;
       }
       if (result.http === 200 && (code === 0 || result.body?.checked_in)) {
         // 签到积分 = 本次实际入账：优先 claim 返回值；claim 不带分时取当日「签到奖励」积分包额度
-        const usage = await getCredits(token, deviceId);
+        const usage = await getCredits(token, deviceId, mode);
         let earned = result.body?.credits ?? null;
         if (earned == null)
           earned = usage?.todayCheckin > 0 ? usage.todayCheckin : 0;
         results.push({
           name,
+          mode,
           ok: true,
           earned,
           already: false,
@@ -337,25 +395,29 @@ async function runCheckin(env) {
       } else {
         results.push({
           name,
+          mode,
           ok: false,
           reason: result.body?.message || "HTTP " + result.http,
         });
       }
     } catch (e) {
-      results.push({ name, ok: false, reason: e.message });
+      results.push({ name, mode, ok: false, reason: e.message });
     }
   }
 
-  // 每个账号的会话更新日期独立，剩余天数按账号附加到对应结果
+  // 每个账号的凭证模式独立，剩余天数按账号附加到对应结果
   // （循环内每个账号恰好产生一条 result，顺序与 accounts 一致）
   for (const [i, r] of results.entries())
-    r.sessionLeft = sessionLeftDays(accounts[i].sessionDate);
+    r.sessionLeft =
+      r.mode === "refresh"
+        ? refreshLeftDays(accounts[i].refreshExpiry)
+        : sessionLeftDays(accounts[i].sessionDate);
 
   const time = bjNow().toISOString().replace("T", " ").slice(0, 19);
   const lines = ["Trae 自动签到"];
   if (gaps.length)
     lines.push(
-      `⚠️ 未配置 ${gaps.map((n) => `TRAE_SESSION${n === 1 ? "" : "_" + n}`).join("，")}，对应账号不会签到`
+      `⚠️ 编号 ${gaps.join("、")} 的账号凭证缺失（TRAE_SESSION / TRAE_REFRESH_TOKEN 均未配置），不会签到`
     );
   for (const [i, r] of results.entries()) {
     if (i > 0) lines.push(""); // 多账号之间空一行分隔
@@ -369,13 +431,23 @@ async function runCheckin(env) {
     } else {
       lines.push(`签到结果：❌ 失败（${r.reason}）`);
     }
-    // 会话到期提醒：剩 3 天以内 ⚠️ 高亮，避免突然失效才发现
+    // 凭证到期提醒：剩 3 天以内 ⚠️ 高亮，避免突然失效才发现
     if (r.sessionLeft != null) {
-      if (r.sessionLeft <= 0)
-        lines.push("⚠️ 会话可能已过期：请重新登录 trae.cn，复制新的 X-Cloudide-Session 后运行 npm run deploy");
-      else if (r.sessionLeft <= 3)
-        lines.push(`⚠️ 会话约剩 ${r.sessionLeft} 天：请尽快重新登录 trae.cn 更新（复制 Cookie 后 npm run deploy）`);
-      else lines.push(`会话有效期：约剩 ${r.sessionLeft} 天`);
+      if (r.mode === "refresh") {
+        if (r.sessionLeft <= 0)
+          lines.push("⚠️ 续期凭证可能已过期：请在 Trae 客户端登录该账号后运行 npm run extract 重新提取");
+        else if (r.sessionLeft <= REFRESH_WARN_DAYS)
+          lines.push(`⚠️ 续期凭证约剩 ${r.sessionLeft} 天：请在 Trae 客户端登录状态下运行 npm run extract 刷新`);
+        else lines.push(`凭证模式：自动续期（约剩 ${r.sessionLeft} 天）`);
+      } else {
+        if (r.sessionLeft <= 0)
+          lines.push("⚠️ 会话可能已过期：请重新登录 trae.cn，复制新的 X-Cloudide-Session 后运行 npm run deploy");
+        else if (r.sessionLeft <= 3)
+          lines.push(`⚠️ 会话约剩 ${r.sessionLeft} 天：请尽快重新登录 trae.cn 更新（复制 Cookie 后 npm run deploy）`);
+        else lines.push(`会话有效期：约剩 ${r.sessionLeft} 天`);
+      }
+    } else if (r.mode === "refresh") {
+      lines.push("凭证模式：自动续期");
     }
   }
   lines.push(`签到时间：${time}`);

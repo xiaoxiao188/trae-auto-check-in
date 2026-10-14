@@ -6,6 +6,7 @@
   "description": "Trae daily check-in on Cloudflare Workers",
   "scripts": {
     "deploy": "node deploy.mjs",
+    "extract": "node extract.mjs",
     "secrets": "wrangler secret bulk secrets.json",
     "dev": "wrangler dev --test-scheduled",
     "tail": "wrangler tail",

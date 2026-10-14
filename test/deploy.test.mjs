@@ -95,4 +95,24 @@ test("collectChanges：输入新密钥与新触发时间", async () => {
   assert.equal(secrets.TRAE_SESSION, "new-session");
 });
 
+test("collectChanges：extraLines 展示在汇总区", async () => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    await collectChanges(
+      async () => "",
+      { TRAE_SESSION: "s1" },
+      "05 2 * * *",
+      new Set(),
+      ["续期凭证：已自动提取（stars 175******08，约剩 170 天）"]
+    );
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logs.some((l) => l.includes("—— 即将部署 ——")));
+  assert.ok(logs.some((l) => l.includes("续期凭证：已自动提取")));
+  assert.ok(logs.some((l) => l.includes("密钥：沿用现有值")));
+});
+
 
