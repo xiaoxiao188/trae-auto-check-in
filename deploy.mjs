@@ -74,19 +74,48 @@ export const beijingToCron = (text) => {
 const isValidCron = (cron) =>
   /^[\d*,\-\/ ]+$/.test(cron) && cron.trim().split(/\s+/).length === 5;
 
-// 把新 cron 写进 wrangler.toml 文本：更新 crons 行，并同步 [triggers] 上方的注释行；
-// 找不到 crons 配置时返回 null（由调用方报错）
+// 主签到失败后的自动重试：主 cron 之后按分钟偏移各加一条重试 cron（间隔 10~30 分钟），
+// 共 3 轮；Worker 靠 [vars] RETRY_CRONS 用 event.cron 区分重试轮（Cloudflare 的 scheduled
+// 事件单次最长 15 分钟，等待 10~30 分钟的延迟只能靠多条 cron 实现）
+const RETRY_OFFSETS_MIN = [20, 50, 80];
+
+// 由主 cron（每日 "M H * * *"）派生重试 cron 列表；主 cron 非每日定时则无法派生，返回 []
+export const retryCronsFor = (mainCron) => {
+  const m = mainCron?.match(/^(\d{1,2}) (\d{1,2}) \* \* \*$/);
+  if (!m) return [];
+  const base = Number(m[1]) + Number(m[2]) * 60; // UTC 当日分钟数
+  return RETRY_OFFSETS_MIN.map((off) => {
+    const t = (base + off) % 1440;
+    return `${String(t % 60).padStart(2, "0")} ${Math.floor(t / 60)} * * *`;
+  });
+};
+
+// 把主 cron 与派生的重试 cron 写进 wrangler.toml 文本：更新 crons 行、[triggers] 上方注释，
+// 以及 [vars] RETRY_CRONS（Worker 运行时读取）；找不到 crons 配置时返回 null（由调用方报错）
 export function applyCron(toml, newCron) {
   if (!/crons = \[[^\]]*\]/.test(toml)) return null;
-  let out = toml.replace(/crons = \[[^\]]*\]/, `crons = ["${newCron}"]`);
+  const retries = retryCronsFor(newCron);
+  const all = [newCron, ...retries];
+  let out = toml.replace(
+    /crons = \[[^\]]*\]/,
+    `crons = [${all.map((c) => `"${c}"`).join(", ")}]`
+  );
   const bj = cronToBeijing(newCron);
   if (bj) {
     const [mi, hr] = newCron.split(" ");
+    const retryBjs = retries.map(cronToBeijing).filter(Boolean);
     out = out.replace(
       /(^#[^\n]*\n)(\[triggers\])/m,
-      `# 每日北京时间 ${bj} 触发 = UTC ${String(hr).padStart(2, "0")}:${String(mi).padStart(2, "0")}，错开签到高峰\n$2`
+      `# 每日北京时间 ${bj} 触发 = UTC ${String(hr).padStart(2, "0")}:${String(mi).padStart(2, "0")}，错开签到高峰` +
+        (retryBjs.length ? `，失败后 ${retryBjs.join(" / ")} 自动重试` : "") +
+        `\n$2`
     );
   }
+  const varLine = `RETRY_CRONS = '${JSON.stringify(retries)}'`;
+  if (/^RETRY_CRONS = /m.test(out)) out = out.replace(/^RETRY_CRONS = .*/m, varLine);
+  else if (/^\[vars\]/m.test(out))
+    out = out.replace(/^\[vars\]/m, `[vars]\n${varLine}`);
+  else out = out.trimEnd() + `\n\n[vars]\n${varLine}\n`;
   return out;
 }
 
@@ -169,6 +198,11 @@ export async function collectChanges(ask, secrets, curCron, remoteSecrets = new 
           : "沿用当前配置"
     }`
   );
+  const retryBjs = retryCronsFor(newCron).map(cronToBeijing).filter(Boolean);
+  if (retryBjs.length)
+    console.log(
+      `失败重试：${retryBjs.join(" / ")}（共 ${retryBjs.length} 次，成功才补推）`
+    );
   const go = (await ask("确认执行部署？（回车=部署，n=取消）: ")).trim().toLowerCase();
   return {
     confirmed: go !== "n" && go !== "no" && go !== "否",
@@ -192,9 +226,12 @@ if (isMain) {
   try {
     toml = readFileSync(WRANGLER_FILE, "utf8");
   } catch {}
-  const curCron = (toml.match(/crons = \[([^\]]*)\]/)?.[1] || "")
+  // crons 现含主签到与多条重试 cron，主签到 = 第一条
+  const curCron = ((toml.match(/crons = \[([^\]]*)\]/)?.[1] || "")
     .replace(/["']/g, "")
-    .trim();
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean))[0] || "";
 
   // 部署前自动提取续期凭证：本机有已登录的 Trae 客户端即刷新 RefreshToken 并随部署上传
   // （每次部署自动保鲜，约半年一次的凭证更新也只需这一条命令）。
@@ -267,15 +304,21 @@ if (isMain) {
     writeFileSync(SECRETS_FILE, JSON.stringify(merged, null, 2) + "\n");
 
     let failed = false;
-    if (toml && newCron !== curCron) {
+    if (toml) {
+      // 主时间不变也可能需要写：旧版 wrangler.toml 只有单条 cron、没有重试 cron 与
+      // RETRY_CRONS，这里一并补齐；输出与文件一致时（幂等）不写也不提示
       const updated = applyCron(toml, newCron);
       if (updated == null) {
         console.error(`${WRANGLER_FILE} 未找到 crons 配置（[triggers] 段），请手动补充后再部署`);
         failed = true;
-      } else {
+      } else if (updated !== toml) {
         writeFileSync(WRANGLER_FILE, updated);
         const bj = cronToBeijing(newCron);
-        console.log(`已更新触发时间：${bj ? `北京 ${bj}` : `cron ${newCron}`}`);
+        const retryBjs = retryCronsFor(newCron).map(cronToBeijing).filter(Boolean);
+        console.log(
+          `已更新触发时间：${bj ? `北京 ${bj}` : `cron ${newCron}`}` +
+            (retryBjs.length ? `，失败后 ${retryBjs.join(" / ")} 自动重试` : "")
+        );
       }
     }
     if (!failed) {

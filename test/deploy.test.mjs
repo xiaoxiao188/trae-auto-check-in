@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import {
   cronToBeijing,
   beijingToCron,
+  retryCronsFor,
   applyCron,
   createAsker,
   collectChanges,
@@ -31,11 +32,41 @@ test("cron 双向转换往返一致", () => {
   }
 });
 
-test("applyCron：更新 crons 行并同步注释", () => {
+test("retryCronsFor：由主 cron 派生重试 cron（间隔 10~30 分钟）", () => {
+  assert.deepEqual(retryCronsFor("05 2 * * *"), [
+    "25 2 * * *",
+    "55 2 * * *",
+    "25 3 * * *",
+  ]);
+  assert.deepEqual(cronToBeijing("25 2 * * *"), "10:25"); // 与主签到间隔 20 分钟
+  // 跨日：主签到 UTC 23:30，+80 分钟落到次日 00:50
+  assert.deepEqual(retryCronsFor("30 23 * * *"), [
+    "50 23 * * *",
+    "20 0 * * *",
+    "50 0 * * *",
+  ]);
+  assert.deepEqual(retryCronsFor("*/5 * * * *"), []); // 非每日定时无法派生
+  assert.deepEqual(retryCronsFor(undefined), []);
+});
+
+test("applyCron：更新 crons 行、注释与 RETRY_CRONS 变量", () => {
   const toml = `# 每日北京时间 10:05 触发 = UTC 02:05，错开签到高峰\n[triggers]\ncrons = ["05 2 * * *"]\n`;
   const out = applyCron(toml, "30 0 * * *");
-  assert.match(out, /crons = \["30 0 \* \* \*"\]/);
-  assert.match(out, /# 每日北京时间 08:30 触发 = UTC 00:30/);
+  assert.match(out, /crons = \["30 0 \* \* \*", "50 0 \* \* \*", "20 1 \* \* \*", "50 1 \* \* \*"\]/);
+  assert.match(out, /# 每日北京时间 08:30 触发 = UTC 00:30，错开签到高峰，失败后 08:50 \/ 09:20 \/ 09:50 自动重试/);
+  assert.match(out, /\[vars\]\nRETRY_CRONS = '\["50 0 \* \* \*","20 1 \* \* \*","50 1 \* \* \*"\]'/);
+});
+
+test("applyCron：非每日主 cron 不加重试，RETRY_CRONS 为空数组", () => {
+  const toml = `# 注释\n[triggers]\ncrons = ["05 2 * * *"]\n\n[vars]\nRETRY_CRONS = '["x"]'\n`;
+  const out = applyCron(toml, "*/5 * * * *");
+  assert.match(out, /crons = \["\*\/5 \* \* \* \*"\]/);
+  assert.match(out, /RETRY_CRONS = '\[\]'/);
+});
+
+test("applyCron：幂等，重复应用输出不变", () => {
+  const toml = `name = "trae-checkin"\n\n# 每日北京时间 10:05 触发 = UTC 02:05，错开签到高峰，失败后 10:25 / 10:55 / 11:25 自动重试\n[triggers]\ncrons = ["05 2 * * *", "25 2 * * *", "55 2 * * *", "25 3 * * *"]\n\n[vars]\nRETRY_CRONS = '["25 2 * * *","55 2 * * *","25 3 * * *"]'\n`;
+  assert.equal(applyCron(toml, "05 2 * * *"), toml);
 });
 
 test("applyCron：找不到 crons 配置返回 null", () => {

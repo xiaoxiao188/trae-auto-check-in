@@ -338,43 +338,104 @@ function refreshLeftDays(expiry) {
   return Math.floor(ms / 86400e3);
 }
 
-async function runCheckin(env) {
+// 重试轮 cron 列表（JSON 数组字符串，deploy 脚本随主 cron 生成并写入 wrangler.toml [vars]）。
+// scheduled 事件用 event.cron 与之比对区分「主签到轮」与「第 N 次重试轮」
+export function retryCronList(env) {
+  try {
+    const arr = JSON.parse(env.RETRY_CRONS || "[]");
+    return Array.isArray(arr) ? arr.filter((c) => typeof c === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+// 每日 cron（"M H * * *"，UTC）→ 北京时间 HH:MM；非每日定时返回 null。
+// 与 deploy.mjs 的 cronToBeijing 同款（Worker 不能 import 用到 node:fs 的部署脚本，只能各存一份）
+export const cronToBj = (cron) => {
+  const m = cron?.match?.(/^(\d{1,2}) (\d{1,2}) \* \* \*$/);
+  if (!m) return null;
+  const bj = (Number(m[2]) * 60 + Number(m[1]) + 8 * 60) % 1440;
+  return `${String(Math.floor(bj / 60)).padStart(2, "0")}:${String(bj % 60).padStart(2, "0")}`;
+};
+
+// 重试轮推送决策（导出供测试）：无可重试账号、或中间轮无补签成功 → 返回不推送的原因，
+// 其余情况返回 null 照常推送。中间轮失败不推（主轮失败已推过，避免一天连推多条失败）
+export function retrySkipReason(results, round, total) {
+  if (!round) return null;
+  if (!results.length)
+    return `第 ${round}/${total} 次重试：全部账号已签到或凭证失效，无需重试`;
+  if (round < total && !results.some((r) => r.ok && !r.already))
+    return `第 ${round}/${total} 次重试：仍失败，不推送，等待下一轮`;
+  return null;
+}
+
+// 续期模式的设备密钥对（TRAE_DEVICE，机器级各账号共用）；缺失或损坏时相关账号回退 Cookie 模式
+function loadDevice(env) {
+  if (!env.TRAE_DEVICE) return null;
+  try {
+    const d = JSON.parse(env.TRAE_DEVICE);
+    if (d?.PrivateKey && d.DeviceID && d.DevicePublicKey) return d;
+  } catch {}
+  return null;
+}
+
+// 取账号可用 token：续期模式换绑设备的新 JWT（失败回退 Cookie），Cookie 模式换新 JWT；都失败抛错
+async function acquireToken(acc, device) {
+  if (acc.refreshToken && device) {
+    const r = await renewToken(acc.refreshToken, device);
+    if (r.ok) return { token: r.token, mode: "refresh" };
+    if (acc.session)
+      return { token: await getToken(acc.session), mode: "cookie" };
+    throw new Error(
+      `自动续期失败（${r.code ?? ""} ${r.error}）：请运行 npm run extract 重新提取`
+    );
+  }
+  return { token: await getToken(acc.session), mode: "cookie" };
+}
+
+// scheduled 入口：event.cron 命中重试列表 → 重试轮，否则主签到轮
+async function runScheduled(env, cron) {
+  const retries = retryCronList(env);
+  const round = retries.indexOf(cron) + 1;
+  return runCheckin(
+    env,
+    round ? { retryRound: round, totalRounds: retries.length } : {}
+  );
+}
+
+// opts.retryRound > 0 表示这是失败后的第 N 次自动重试轮（cron 触发）。
+// 重试轮里「今日已签到」的账号静默跳过（主轮推送已报过），凭证换不出 token 的账号
+// （会话/续期失效）重试也救不回，同样静默跳过，只重试仍可能签上的账号
+async function runCheckin(env, opts = {}) {
+  const round = opts.retryRound || 0;
+  const total = opts.totalRounds || 0;
+  const isFinal = round > 0 && round === total;
   const { accounts, gaps } = iterAccounts(env);
   if (!accounts.length) return "缺少环境变量 TRAE_SESSION 或 TRAE_REFRESH_TOKEN";
 
-  // 续期模式的设备密钥对（TRAE_DEVICE，机器级各账号共用）；缺失或损坏时相关账号回退 Cookie 模式
-  let device = null;
-  if (env.TRAE_DEVICE) {
-    try {
-      device = JSON.parse(env.TRAE_DEVICE);
-    } catch {}
-    if (!device?.PrivateKey || !device?.DeviceID || !device?.DevicePublicKey) device = null;
-  }
+  const device = loadDevice(env);
 
   const results = [];
-  for (const [i, acc] of accounts.entries()) {
-    if (i > 0) await sleep(3000 + Math.random() * 3000); // 多账号错开，规避风控
+  let first = true;
+  for (const acc of accounts) {
+    if (!first) await sleep(3000 + Math.random() * 3000); // 多账号错开，规避风控
+    first = false;
     let deviceId = acc.deviceId || randomDeviceId();
     // 续期模式无 Cookie，GetUserInfo 不可用（401），用提取时记录的昵称兜底
     let name = acc.refreshLabel || acc.name;
     let mode = acc.refreshToken && device ? "refresh" : "cookie";
+    // sessionLeft 随结果一并记录（mode 定了才能选对计法；重试轮会跳过部分账号，不能事后按下标配对）
+    const push = (r) => {
+      r.sessionLeft =
+        r.mode === "refresh"
+          ? refreshLeftDays(acc.refreshExpiry)
+          : sessionLeftDays(acc.sessionDate);
+      results.push(r);
+    };
     try {
-      let token;
-      if (mode === "refresh") {
-        const r = await renewToken(acc.refreshToken, device);
-        if (r.ok) {
-          token = r.token;
-        } else if (acc.session) {
-          token = await getToken(acc.session); // 续期失败回退 Cookie 模式
-          mode = "cookie";
-        } else {
-          throw new Error(
-            `自动续期失败（${r.code ?? ""} ${r.error}）：请运行 npm run extract 重新提取`
-          );
-        }
-      } else {
-        token = await getToken(acc.session);
-      }
+      const got = await acquireToken(acc, device);
+      mode = got.mode;
+      const token = got.token;
       // 昵称与今日签到状态相互独立，并行查询省一个来回
       const [info, st0] = await Promise.all([
         mode === "cookie" ? getUserInfo(token, acc.session) : null,
@@ -385,10 +446,11 @@ async function runCheckin(env) {
         const live = displayLabel(acc, info);
         if (live !== acc.name) name = live;
       }
-      // 今日已签到则跳过 claim，直接显示 +0（避免重复请求触发风控）
+      // 今日已签到则跳过 claim，直接显示 +0（避免重复请求触发风控）；重试轮静默跳过
       if (st0?.checked_in) {
+        if (round) continue;
         const usage = await getCredits(token, deviceId, mode);
-        results.push({
+        push({
           name,
           mode,
           ok: true,
@@ -415,7 +477,7 @@ async function runCheckin(env) {
         let earned = result.body?.credits ?? null;
         if (earned == null)
           earned = usage?.todayCheckin > 0 ? usage.todayCheckin : 0;
-        results.push({
+        push({
           name,
           mode,
           ok: true,
@@ -426,7 +488,7 @@ async function runCheckin(env) {
           total: usage?.total,
         });
       } else {
-        results.push({
+        push({
           name,
           mode,
           ok: false,
@@ -434,21 +496,19 @@ async function runCheckin(env) {
         });
       }
     } catch (e) {
-      results.push({ name, mode, ok: false, reason: e.message });
+      if (!round) push({ name, mode, ok: false, reason: e.message });
     }
   }
 
-  // 每个账号的凭证模式独立，剩余天数按账号附加到对应结果
-  // （循环内每个账号恰好产生一条 result，顺序与 accounts 一致）
-  for (const [i, r] of results.entries())
-    r.sessionLeft =
-      r.mode === "refresh"
-        ? refreshLeftDays(accounts[i].refreshExpiry)
-        : sessionLeftDays(accounts[i].sessionDate);
+  // 重试轮收尾：没有可重试的账号 / 中间轮没有补签成功 → 不推送
+  const skip = retrySkipReason(results, round, total);
+  if (skip) return skip;
 
   const time = bjNow().toISOString().replace("T", " ").slice(0, 19);
-  const lines = ["Trae 自动签到"];
-  if (gaps.length)
+  const lines = [
+    round ? `Trae 自动签到（第 ${round}/${total} 次重试）` : "Trae 自动签到",
+  ];
+  if (gaps.length && !round)
     lines.push(
       `⚠️ 编号 ${gaps.join("、")} 的账号凭证缺失（TRAE_SESSION / TRAE_REFRESH_TOKEN 均未配置），不会签到`
     );
@@ -483,6 +543,20 @@ async function runCheckin(env) {
       lines.push("凭证模式：自动续期");
     }
   }
+  // 有失败时补一句重试说明：主轮预告重试时间点，重试轮说明还有没有下一轮
+  if (results.some((r) => !r.ok)) {
+    if (round) {
+      lines.push(
+        isFinal ? "今日自动重试已全部用完" : "失败的账号稍后还会自动重试"
+      );
+    } else {
+      const times = retryCronList(env).map(cronToBj).filter(Boolean);
+      if (times.length)
+        lines.push(
+          `自动重试：${times.join("、")} 共 ${times.length} 次（成功即补推；全部失败则最后一轮再推一次）`
+        );
+    }
+  }
   lines.push(`签到时间：${time}`);
   const summary = lines.join("\n");
   // 钉钉用 markdown 推送：标题加粗（#### **标题**），标题下用 --- 分割线实现下划线效果；
@@ -498,10 +572,11 @@ async function runCheckin(env) {
 }
 
 export default {
-  // Cron Trigger 入口：每天定时自动执行
+  // Cron Trigger 入口：每天定时自动执行。主时间点跑主签到轮，失败后
+  // 由 wrangler.toml 里的重试 cron（间隔 10~30 分钟）触发重试轮，共 3 轮
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      runCheckin(env)
+      runScheduled(env, event.cron)
         .then((r) => console.log(r))
         .catch((e) => console.error("签到执行失败:", e))
     );

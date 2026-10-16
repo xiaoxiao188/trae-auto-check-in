@@ -2,6 +2,10 @@ name = "trae-checkin"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
-# 每日北京时间 10:05 触发 = UTC 02:05，错开签到高峰
+# 每日北京时间 10:05 触发 = UTC 02:05，错开签到高峰，失败后 10:25 / 10:55 / 11:25 自动重试
 [triggers]
-crons = ["05 2 * * *"]
+crons = ["05 2 * * *", "25 2 * * *", "55 2 * * *", "25 3 * * *"]
+
+# 重试轮 cron 列表：Worker 用 event.cron 与之比对区分主签到轮与重试轮（deploy 脚本自动维护）
+[vars]
+RETRY_CRONS = '["25 2 * * *","55 2 * * *","25 3 * * *"]'
